@@ -1,0 +1,15 @@
+[package]
+name = "kernel-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+panic = "abort"
+debug = true
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = ["Wdk", "Wdk_System", "Wdk_System_SystemServices"] }

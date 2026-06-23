@@ -1,0 +1,4 @@
+pub type POOL_FLAGS = u64;
+
+pub const POOL_FLAG_NON_PAGED: POOL_FLAGS = 64;
+pub const POOL_FLAG_PAGED: POOL_FLAGS = 256;
