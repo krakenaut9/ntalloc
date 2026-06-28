@@ -13,3 +13,6 @@ lto = true
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = ["Wdk", "Wdk_System", "Wdk_System_SystemServices"] }
+
+[dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
