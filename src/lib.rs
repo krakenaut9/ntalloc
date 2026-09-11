@@ -1,6 +1,6 @@
 //! Windows kernel-mode pool allocator for `#![no_std]` Rust drivers.
 //!
-//! `kernel-alloc` wraps the WDK pool APIs (`ExAllocatePool2`, `ExFreePool`,
+//! `ntalloc` wraps the WDK pool APIs (`ExAllocatePool2`, `ExFreePool`,
 //! `ExFreePoolWithTag`) behind the standard [`GlobalAlloc`] trait and the
 //! unstable [`Allocator`] trait, so ordinary `alloc`-crate types (`Vec`,
 //! `Box`, ...) can be backed by kernel pool memory from a `#![no_std]`
@@ -36,7 +36,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use kernel_alloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+//! use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
 //!
 //! type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
 //!
@@ -139,7 +139,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```
-    /// use kernel_alloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
     ///
     /// let ptr = 0x1000 as *mut u8;
     /// let location = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer_location(ptr);
@@ -163,7 +163,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```
-    /// use kernel_alloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
     ///
     /// type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
     ///
@@ -217,7 +217,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```
-    /// use kernel_alloc::{PagedAlloc, MIN_ALIGNMENT, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{PagedAlloc, MIN_ALIGNMENT, DEFAULT_MEMORY_TAG};
     /// use windows_sys::Wdk::System::SystemServices::PAGE_SIZE;
     ///
     /// type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
@@ -264,7 +264,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use kernel_alloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
     ///
     /// let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(64);
     /// assert!(!ptr.is_null());
@@ -292,7 +292,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use kernel_alloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
     ///
     /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
     ///
@@ -352,7 +352,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```
-    /// use kernel_alloc::{PagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{PagedAlloc, DEFAULT_MEMORY_TAG};
     ///
     /// let ptr = 0x1003 as *mut u8;
     /// let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, 64);
@@ -393,7 +393,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// # Examples
     /// ```no_run
     /// use core::alloc::Layout;
-    /// use kernel_alloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
     ///
     /// let layout = Layout::from_size_align(16, 64).unwrap();
     /// let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
@@ -477,7 +477,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use kernel_alloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
     ///
     /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
     ///

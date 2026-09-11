@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "kernel-alloc"
+name = "ntalloc"
 version = "0.1.0"
 dependencies = [
  "windows-sys",
