@@ -29,9 +29,10 @@
 //! pointer up to the requested alignment, and stashes the original
 //! (unaligned) pointer in the pointer-sized slot immediately before the
 //! aligned pointer (see [`KAlloc::align_up_to`] for why that slot is always
-//! available). An internal `deallocate_aligned` helper reads that slot back
-//! out to recover the pointer that must be passed to
-//! `ExFreePool`/`ExFreePoolWithTag`.
+//! available). [`KAlloc::deallocate_aligned`] reads that slot back out to
+//! recover the pointer that must be passed to
+//! `ExFreePool`/`ExFreePoolWithTag`, which is why an over-aligned allocation
+//! has to be released through it rather than through [`KAlloc::deallocate`].
 //!
 //! # Example
 //!
@@ -42,7 +43,8 @@
 //!
 //! let ptr = Alloc::allocate(64);
 //! assert!(!ptr.is_null());
-//! Alloc::deallocate(ptr);
+//! // SAFETY: `ptr` came from `Alloc::allocate` and needed no realignment.
+//! unsafe { Alloc::deallocate(ptr) };
 //! ```
 
 #![no_std]
@@ -68,6 +70,12 @@ use windows_sys::Wdk::System::SystemServices::{
 
 /// Default memory tag for allocations, visible via kernel debugger pool
 /// inspection tools such as `!poolused`/`!poolfind`.
+///
+/// Built with `from_ne_bytes` deliberately. Every Windows target is
+/// little-endian and the kernel reads a pool tag as a little-endian `u32`,
+/// so native byte order is what makes the debugger print `Rust` rather than
+/// `tsuR`. This is not a portability oversight; do not change it to
+/// `from_be_bytes`.
 pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 
 /// A stateless, `#![no_std]`-friendly Windows kernel pool allocator.
@@ -101,9 +109,10 @@ pub struct KAlloc<
 
 /// [`KAlloc`] backed by the paged pool (`POOL_FLAG_PAGED`).
 ///
-/// Memory from the paged pool may be paged out to disk and must only be
-/// touched at `PASSIVE_LEVEL` (never from a DPC, ISR, or other elevated
-/// IRQL).
+/// Memory from the paged pool may be paged out to disk, so it may only be
+/// touched at IRQL `APC_LEVEL` or below — that is, strictly below
+/// `DISPATCH_LEVEL`. Never touch it from a DPC, from an ISR, or while
+/// holding a spin lock.
 pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEALLOC: bool = true> =
     KAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
 /// [`KAlloc`] backed by the non-paged pool (`POOL_FLAG_NON_PAGED`).
@@ -130,23 +139,13 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// original (pre-alignment) pointer is stored by
     /// [`KAlloc::save_original_pointer`].
     ///
-    /// # Parameters
-    /// - `ptr`: an aligned pointer previously returned by
-    ///   [`KAlloc::allocate_aligned`].
-    ///
-    /// # Returns
-    /// A pointer to the `*mut u8` slot immediately preceding `ptr`.
-    ///
-    /// # Examples
-    /// ```
-    /// use ntalloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
-    ///
-    /// let ptr = 0x1000 as *mut u8;
-    /// let location = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer_location(ptr);
-    /// assert_eq!(location, (ptr as usize - POINTER_SIZE) as *mut *mut u8);
-    /// ```
+    /// `ptr` must be a pointer returned by [`KAlloc::allocate_aligned`] for
+    /// a layout that required realignment; the slot this names is only
+    /// guaranteed to exist, and to belong to the caller, for such a pointer.
+    /// That restriction is why this is not part of the public API: nothing
+    /// in the signature can enforce it.
     #[inline(always)]
-    pub fn original_pointer_location(ptr: *mut u8) -> *mut *mut u8 {
+    fn original_pointer_location(ptr: *mut u8) -> *mut *mut u8 {
         unsafe { (ptr.cast::<*mut u8>()).offset(-1) }
     }
 
@@ -154,29 +153,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// `ptr`, so it can later be recovered by [`KAlloc::original_pointer`]
     /// and passed to the real free routine.
     ///
-    /// # Parameters
-    /// - `ptr`: the (re-aligned) pointer that will be handed out to the
-    ///   caller; must have at least `POINTER_SIZE` bytes of valid, writable
-    ///   memory immediately before it.
-    /// - `original_ptr`: the pointer actually returned by the underlying
-    ///   allocation, to be restored on deallocation.
-    ///
-    /// # Examples
-    /// ```
-    /// use ntalloc::{PagedAlloc, POINTER_SIZE, DEFAULT_MEMORY_TAG};
-    ///
-    /// type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
-    ///
-    /// let mut buffer: Vec<u8> = Vec::with_capacity(16);
-    /// // Simulate a pointer that has already been aligned/offset within `buffer`.
-    /// let aligned_ptr = unsafe { buffer.as_mut_ptr().byte_add(POINTER_SIZE) };
-    /// let original_ptr = 0x1000 as *mut u8;
-    ///
-    /// Alloc::save_original_pointer(aligned_ptr, original_ptr);
-    /// assert_eq!(Alloc::original_pointer(aligned_ptr), original_ptr);
-    /// ```
+    /// `ptr` must have at least [`POINTER_SIZE`] bytes of valid, writable
+    /// memory immediately before it. [`KAlloc::allocate_aligned`] guarantees
+    /// that: the gap [`KAlloc::align_up_to`] opens is a multiple of
+    /// [`MIN_ALIGNMENT`], which is two pointers wide. `original_ptr` is the
+    /// pointer the underlying allocation actually returned, to be restored
+    /// on deallocation.
     #[inline(always)]
-    pub fn save_original_pointer(ptr: *mut u8, original_ptr: *mut u8) {
+    fn save_original_pointer(ptr: *mut u8, original_ptr: *mut u8) {
         let original_ptr_location = Self::original_pointer_location(ptr);
         unsafe {
             *original_ptr_location = original_ptr;
@@ -186,16 +170,11 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Reads back the pointer previously stored by
     /// [`KAlloc::save_original_pointer`].
     ///
-    /// # Parameters
-    /// - `ptr`: an aligned pointer previously returned by
-    ///   [`KAlloc::allocate_aligned`], for which realignment was required.
-    ///
-    /// # Returns
-    /// The original (pre-alignment) pointer.
-    ///
-    /// See [`KAlloc::save_original_pointer`] for a full round-trip example.
+    /// `ptr` must be a pointer returned by [`KAlloc::allocate_aligned`] for
+    /// which realignment was required; for any other pointer the slot read
+    /// here holds unrelated memory.
     #[inline(always)]
-    pub fn original_pointer(ptr: *mut u8) -> *mut u8 {
+    fn original_pointer(ptr: *mut u8) -> *mut u8 {
         let original_ptr_location = Self::original_pointer_location(ptr);
         unsafe { *original_ptr_location }
     }
@@ -298,7 +277,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// let ptr = Alloc::allocate(64);
     /// assert!(!ptr.is_null());
-    /// Alloc::deallocate(ptr);
+    /// // SAFETY: `ptr` came from `Alloc::allocate` and needed no realignment.
+    /// unsafe { Alloc::deallocate(ptr) };
     /// ```
     pub fn allocate(size: usize) -> *mut u8 {
         if size == 0 {
@@ -329,9 +309,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Rounds `allocated_buffer` up to the next address that is a multiple
     /// of `alignment`. The result is always strictly greater than
-    /// `allocated_buffer` by at least one byte, even if it was already
-    /// aligned — [`KAlloc::allocate_aligned`] relies on this to always have
-    /// room to stash a pointer just before the aligned one it returns.
+    /// `allocated_buffer`, even when it was already aligned, which is what
+    /// leaves [`KAlloc::allocate_aligned`] room to stash a pointer just
+    /// before the address it hands out.
+    ///
+    /// How much room is not guaranteed by this function alone. For an
+    /// arbitrary address the gap can be a single byte, too small to hold a
+    /// pointer. It is sufficient in [`KAlloc::allocate_aligned`] only
+    /// because the address there comes from `ExAllocatePool2` and is
+    /// therefore aligned to at least [`MIN_ALIGNMENT`], while `alignment`
+    /// is a larger power of two — so the gap is a multiple of
+    /// [`MIN_ALIGNMENT`] and never smaller than it.
     ///
     /// # Parameters
     /// - `allocated_buffer`: the pointer to align. This function does not
@@ -385,20 +373,28 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// # Note
     /// A pointer returned from this function when realignment was required
     /// cannot be freed with the plain [`KAlloc::deallocate`] — that function
-    /// has no way to recover the original pointer. Free it through this
-    /// type's [`GlobalAlloc`] or [`Allocator`] trait implementation instead
-    /// (for a pointer that did *not* need realignment, [`KAlloc::deallocate`]
-    /// is fine either way).
+    /// has no way to recover the original pointer. Free it with
+    /// [`KAlloc::deallocate_aligned`], passing the same `layout`, or through
+    /// this type's [`GlobalAlloc`]/[`Allocator`] implementations, which do
+    /// the same thing. (For a pointer that did *not* need realignment,
+    /// [`KAlloc::deallocate`] is fine either way — but since only `layout`
+    /// distinguishes the two cases, always pairing with
+    /// [`KAlloc::deallocate_aligned`] is the rule that cannot go wrong.)
     ///
     /// # Examples
     /// ```no_run
     /// use core::alloc::Layout;
     /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
     ///
+    /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
+    ///
     /// let layout = Layout::from_size_align(16, 64).unwrap();
-    /// let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
+    /// let ptr = Alloc::allocate_aligned(layout);
     /// assert!(!ptr.is_null());
     /// assert_eq!(ptr as usize % layout.align(), 0);
+    ///
+    /// // SAFETY: `ptr` came from `allocate_aligned` with this exact layout.
+    /// unsafe { Alloc::deallocate_aligned(ptr, layout) };
     /// ```
     pub fn allocate_aligned(layout: Layout) -> *mut u8 {
         if Self::is_kernel_aligned(layout) {
@@ -423,7 +419,11 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Returns
     /// - `Ok(_)` — a `NonNull<[u8]>` slice of `layout.size()` bytes.
-    /// - `Err(AllocError)` — if the underlying pool allocation fails.
+    /// - `Err(AllocError)` — if the underlying pool allocation fails, and
+    ///   also when `layout.size()` is `0` and `layout.align()` is no greater
+    ///   than [`MIN_ALIGNMENT`], since [`KAlloc::allocate`] short-circuits a
+    ///   zero-size request to a null pointer. The [`Allocator::allocate`]
+    ///   implementation documents that case in full.
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let allocated_raw = Self::allocate_aligned(layout);
 
@@ -468,12 +468,20 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// [`KAlloc::allocate_aligned`] for over-aligned requests — see that
     /// function's documentation for when it is safe to call this directly.
     ///
-    /// # Parameters
-    /// - `ptr`: the pointer to free. Must be non-null, and must have been
-    ///   obtained from the same `KAlloc` configuration (same pool, tag, and
-    ///   `TAGGED_DEALLOC` value). Unlike [`KAlloc::allocate_aligned`]'s
-    ///   internal deallocation path, this function does not check for null
-    ///   before calling `ExFreePool`/`ExFreePoolWithTag`.
+    /// # Safety
+    /// The caller must guarantee all of the following:
+    ///
+    /// - `ptr` is non-null. Unlike [`KAlloc::deallocate_aligned`], this
+    ///   function does not check, and `ExFreePool`/`ExFreePoolWithTag`
+    ///   bugchecks on a null pointer rather than ignoring it the way C's
+    ///   `free` would.
+    /// - `ptr` came from the same `KAlloc` configuration: the same pool
+    ///   flags, the same `MEMORY_TAG`, and the same `TAGGED_DEALLOC`.
+    ///   Freeing with a mismatched tag corrupts the pool.
+    /// - `ptr` is the address the pool returned, not one that
+    ///   [`KAlloc::allocate_aligned`] adjusted for over-alignment. Those go
+    ///   to [`KAlloc::deallocate_aligned`] instead.
+    /// - `ptr` has not already been freed, and is not used afterwards.
     ///
     /// # Examples
     /// ```no_run
@@ -483,9 +491,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// let ptr = Alloc::allocate(64);
     /// assert!(!ptr.is_null());
-    /// Alloc::deallocate(ptr);
+    /// // SAFETY: `ptr` came from `Alloc::allocate` and needed no realignment.
+    /// unsafe { Alloc::deallocate(ptr) };
     /// ```
-    pub fn deallocate(ptr: *mut u8) {
+    pub unsafe fn deallocate(ptr: *mut u8) {
         if TAGGED_DEALLOC {
             Self::deallocate_tagged(ptr);
         } else {
@@ -520,9 +529,33 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Frees a pointer returned by [`KAlloc::allocate_aligned`] for `layout`,
     /// recovering and freeing the original (pre-realignment) pointer when
-    /// `layout`'s alignment required over-allocation. No-op if `ptr` is
-    /// null.
-    fn deallocate_aligned(ptr: *mut u8, layout: Layout) {
+    /// `layout`'s alignment required over-allocation.
+    ///
+    /// This is the counterpart to [`KAlloc::allocate_aligned`]: a pointer
+    /// from that function must be freed through this one, because for an
+    /// over-aligned request the address handed out is not the address the
+    /// pool returned, and only this function knows how to recover it.
+    ///
+    /// Passing a null `ptr` is a no-op.
+    ///
+    /// # Safety
+    /// The caller must guarantee all of the following:
+    ///
+    /// - `ptr` was returned by [`KAlloc::allocate_aligned`] on this same
+    ///   `KAlloc` instantiation — the same pool flags, the same
+    ///   `MEMORY_TAG`, and the same `TAGGED_DEALLOC` — or is null.
+    /// - `layout` is the *exact* `Layout` that was passed to that call.
+    ///   `layout` alone decides whether the original pointer is read back
+    ///   from the slot before `ptr` or `ptr` is freed directly, so a
+    ///   mismatched layout will either hand `ExFreePool` an interior
+    ///   pointer or read [`POINTER_SIZE`] bytes of unrelated memory and
+    ///   free whatever they happen to contain.
+    /// - `ptr` has not already been freed, and is not used afterwards.
+    ///
+    /// None of these can be checked at runtime: an interior pointer and a
+    /// valid one are indistinguishable, and the pool allocator has no way to
+    /// report that a tag or a size did not match.
+    pub unsafe fn deallocate_aligned(ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
         }
@@ -542,7 +575,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         Self::usermode_deallocate(original_ptr, layout);
 
         #[cfg(not(test))]
-        Self::deallocate(original_ptr);
+        // SAFETY: original_ptr is the pool's own address — either `ptr`
+        // itself when no realignment happened, or the value stashed by
+        // allocate_aligned — and this fn's own contract covers the rest.
+        unsafe {
+            Self::deallocate(original_ptr)
+        };
     }
 }
 
@@ -570,7 +608,9 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// (or `realloc`) on this same `KAlloc` instantiation, and `layout` must
     /// be the exact layout used for that allocation.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        Self::deallocate_aligned(ptr, layout);
+        // SAFETY: forwarded straight from GlobalAlloc::dealloc, whose own
+        // contract already requires exactly what deallocate_aligned does.
+        unsafe { Self::deallocate_aligned(ptr, layout) };
     }
 }
 
@@ -604,7 +644,9 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// `layout` must be the same layout that was used to allocate it, per
     /// the [`Allocator::deallocate`] contract.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        Self::deallocate_aligned(ptr.as_ptr(), layout);
+        // SAFETY: forwarded straight from Allocator::deallocate, whose own
+        // contract already requires exactly what deallocate_aligned does.
+        unsafe { Self::deallocate_aligned(ptr.as_ptr(), layout) };
     }
 }
 
@@ -727,7 +769,8 @@ mod tests {
         assert!(!original_ptr.is_null());
         assert!(original_ptr < aligned_ptr);
 
-        PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout);
+        // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
+        unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
     }
 
     #[test]
@@ -737,7 +780,8 @@ mod tests {
         assert!(!aligned_ptr.is_null());
         assert!((aligned_ptr as usize) % layout.align() == 0);
 
-        PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout);
+        // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
+        unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
     }
 
     #[test]
@@ -751,7 +795,8 @@ mod tests {
         assert!(!original_ptr.is_null());
         assert!(original_ptr < aligned_ptr);
 
-        PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout);
+        // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
+        unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
     }
 
     #[test]
@@ -765,6 +810,7 @@ mod tests {
         assert!(!original_ptr.is_null());
         assert!(original_ptr < aligned_ptr);
 
-        PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout);
+        // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
+        unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
     }
 }
