@@ -28,8 +28,10 @@
 //! over-allocates by `layout.align()` extra bytes, rounds the returned
 //! pointer up to the requested alignment, and stashes the original
 //! (unaligned) pointer in the pointer-sized slot immediately before the
-//! aligned pointer (see [`KAlloc::align_up_to`] for why that slot is always
-//! available). [`KAlloc::deallocate_aligned`] reads that slot back out to
+//! aligned pointer. There is always room for that slot because
+//! `ExAllocatePool2` never returns a base below [`MIN_ALIGNMENT`], so
+//! rounding up moves the pointer by a multiple of [`MIN_ALIGNMENT`] — two
+//! pointers — and never by less. [`KAlloc::deallocate_aligned`] reads that slot back out to
 //! recover the pointer that must be passed to
 //! `ExFreePool`/`ExFreePoolWithTag`, which is why an over-aligned allocation
 //! has to be released through it rather than through [`KAlloc::deallocate`].
@@ -62,6 +64,7 @@ use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAGS};
 use alloc::alloc::{AllocError, Allocator};
 use core::{
     alloc::{GlobalAlloc, Layout},
+    num::NonZeroUsize,
     ptr::{NonNull, null_mut, slice_from_raw_parts_mut},
 };
 use windows_sys::Wdk::System::SystemServices::{
@@ -323,12 +326,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Parameters
     /// - `allocated_buffer`: the pointer to align. This function does not
-    ///   dereference the pointer, so it is safe to call with any address.
-    /// - `alignment`: the desired alignment, in bytes. Must be a non-zero
-    ///   power of two, as required by [`Layout`].
+    ///   dereference the pointer, so any address is acceptable.
+    /// - `alignment`: the desired alignment, in bytes. [`NonZeroUsize`]
+    ///   rather than `usize` because `alignment - 1` below would otherwise
+    ///   underflow on `0`, wrapping to a null result in release builds. It
+    ///   must also be a power of two — the masking trick silently returns a
+    ///   non-multiple otherwise — which the type cannot express, so a
+    ///   `debug_assert!` covers that half. [`Layout`] guarantees both
+    ///   properties, and every caller's alignment comes from a [`Layout`].
     ///
     /// # Returns
-    /// The next pointer after `allocated_buffer` that is aligned to
+    /// The next address after `allocated_buffer` that is a multiple of
     /// `alignment`.
     ///
     /// # Note
@@ -337,18 +345,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// of the address space combined with a large `alignment` would wrap
     /// silently — worth noting since kernel-mode pointers often sit near
     /// that boundary.
-    ///
-    /// # Examples
-    /// ```
-    /// use ntalloc::{PagedAlloc, DEFAULT_MEMORY_TAG};
-    ///
-    /// let ptr = 0x1003 as *mut u8;
-    /// let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, 64);
-    /// assert_eq!(aligned as usize % 64, 0);
-    /// assert!(aligned as usize > ptr as usize);
-    /// ```
     #[inline(always)]
-    pub fn align_up_to(allocated_buffer: *mut u8, alignment: usize) -> *mut u8 {
+    fn align_up_to(allocated_buffer: *mut u8, alignment: NonZeroUsize) -> *mut u8 {
+        debug_assert!(
+            alignment.is_power_of_two(),
+            "alignment must be a power of two; the mask below is meaningless otherwise"
+        );
+
+        let alignment = alignment.get();
         let alignment_mask_base = !(alignment - 1);
         ((allocated_buffer as usize & alignment_mask_base) + alignment) as *mut u8
     }
@@ -359,7 +363,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// If `layout.align()` is no stronger than [`KAlloc::kernel_alignment`]
     /// for the requested size, this simply forwards to [`KAlloc::allocate`].
     /// Otherwise it over-allocates by `layout.align()` extra bytes, rounds
-    /// the result up to `layout.align()` with [`KAlloc::align_up_to`], and
+    /// the result up to `layout.align()`, and
     /// stashes the original pointer just before the returned one (see the
     /// crate-level documentation for details).
     ///
@@ -406,7 +410,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
                 return null_mut();
             }
 
-            let aligned = Self::align_up_to(buffer, layout.align());
+            // SAFETY: Layout guarantees a non-zero power-of-two alignment.
+            let alignment = unsafe { NonZeroUsize::new_unchecked(layout.align()) };
+            let aligned = Self::align_up_to(buffer, alignment);
             Self::save_original_pointer(aligned, buffer);
 
             aligned
@@ -706,32 +712,48 @@ mod tests {
     fn align_up_to_test_less_than_min_alignment() {
         let ptr = 0x1003 as *mut u8;
         let alignment = 4;
-        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, alignment);
+        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+            ptr,
+            NonZeroUsize::new(alignment).unwrap(),
+        );
         assert_eq!(aligned_ptr as usize % alignment, 0);
+        assert!(aligned_ptr as usize > ptr as usize);
     }
 
     #[test]
     fn align_up_to_test_greater_than_min_alignment() {
         let ptr = 0x1003 as *mut u8;
         let alignment = 64;
-        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, alignment);
+        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+            ptr,
+            NonZeroUsize::new(alignment).unwrap(),
+        );
         assert_eq!(aligned_ptr as usize % alignment, 0);
+        assert!(aligned_ptr as usize > ptr as usize);
     }
 
     #[test]
     fn align_up_to_test_page_size_alignment() {
         let ptr = 0x1003 as *mut u8;
         let alignment = PAGE_SIZE as usize;
-        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, alignment);
+        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+            ptr,
+            NonZeroUsize::new(alignment).unwrap(),
+        );
         assert_eq!(aligned_ptr as usize % alignment, 0);
+        assert!(aligned_ptr as usize > ptr as usize);
     }
 
     #[test]
     fn align_up_to_test_greater_than_page_size_alignment() {
         let ptr = 0x1003 as *mut u8;
         let alignment = PAGE_SIZE as usize * 2;
-        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(ptr, alignment);
+        let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+            ptr,
+            NonZeroUsize::new(alignment).unwrap(),
+        );
         assert_eq!(aligned_ptr as usize % alignment, 0);
+        assert!(aligned_ptr as usize > ptr as usize);
     }
 
     #[test]
@@ -812,5 +834,52 @@ mod tests {
 
         // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
         unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
+    }
+
+    #[test]
+    fn align_up_to_advances_from_an_already_aligned_base() {
+        // The case the stash scheme actually depends on. Returning an
+        // already-aligned base unchanged would leave no room in front of it.
+        for alignment in [MIN_ALIGNMENT, 64, PAGE_SIZE as usize] {
+            let base = alignment * 4;
+            let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+                base as *mut u8,
+                NonZeroUsize::new(alignment).unwrap(),
+            ) as usize;
+
+            assert_eq!(
+                aligned,
+                base + alignment,
+                "alignment {alignment}: expected a full step past an aligned base"
+            );
+        }
+    }
+
+    #[test]
+    fn align_up_to_always_leaves_room_for_the_stash() {
+        // The gap must hold a pointer. That is not true for an arbitrary base
+        // -- it can be a single byte -- and holds here only because
+        // ExAllocatePool2 never returns a base below MIN_ALIGNMENT. Walk every
+        // residue such a base can have.
+        for alignment in [32usize, 64, 128, PAGE_SIZE as usize] {
+            for step in 0..(alignment / MIN_ALIGNMENT) {
+                let base = 0x10_0000 + step * MIN_ALIGNMENT;
+                let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
+                    base as *mut u8,
+                    NonZeroUsize::new(alignment).unwrap(),
+                ) as usize;
+                let gap = aligned - base;
+
+                assert!(
+                    gap >= POINTER_SIZE,
+                    "alignment {alignment}, base {base:#x}: gap {gap} cannot hold a pointer"
+                );
+                assert_eq!(
+                    gap % MIN_ALIGNMENT,
+                    0,
+                    "gap should be a MIN_ALIGNMENT multiple"
+                );
+            }
+        }
     }
 }
