@@ -31,8 +31,8 @@
 //! aligned pointer. There is always room for that slot because
 //! `ExAllocatePool2` never returns a base below [`MIN_ALIGNMENT`], so
 //! rounding up moves the pointer by a multiple of [`MIN_ALIGNMENT`] — two
-//! pointers — and never by less. [`KAlloc::deallocate_aligned`] reads that slot back out to
-//! recover the pointer that must be passed to
+//! pointers — and never by less. [`KAlloc::deallocate_aligned`] reads that
+//! slot back out to recover the pointer that must be passed to
 //! `ExFreePool`/`ExFreePoolWithTag`, which is why an over-aligned allocation
 //! has to be released through it rather than through [`KAlloc::deallocate`].
 //!
@@ -65,7 +65,7 @@ use alloc::alloc::{AllocError, Allocator};
 use core::{
     alloc::{GlobalAlloc, Layout},
     num::NonZeroUsize,
-    ptr::{NonNull, null_mut, slice_from_raw_parts_mut},
+    ptr::{NonNull, null_mut, slice_from_raw_parts_mut, without_provenance_mut},
 };
 use windows_sys::Wdk::System::SystemServices::{
     ExAllocatePool2, ExFreePool, ExFreePoolWithTag, PAGE_SIZE,
@@ -220,9 +220,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// bytes from the ordinary usermode heap, so the allocator's alignment
     /// and pointer-stashing logic can be exercised by `cargo test` without a
     /// running kernel.
+    ///
+    /// Guards zero exactly as [`KAlloc::kernel_allocate`] does — `alloc` has
+    /// the same non-zero requirement `ExAllocatePool2` has — so that the
+    /// shipped path carries no check its backend already makes.
     #[cfg(test)]
     #[inline(always)]
     fn usermode_allocate(size: usize) -> *mut u8 {
+        if size == 0 {
+            return null_mut();
+        }
+
         unsafe {
             alloc::alloc::alloc(
                 Layout::from_size_align(size, Self::kernel_alignment(size))
@@ -232,17 +240,19 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     }
 
     /// Allocates `size` bytes directly from the kernel pool via
-    /// `ExAllocatePool2`, bypassing the zero-size and usermode-test shims
-    /// used by [`KAlloc::allocate`].
+    /// `ExAllocatePool2`, bypassing the usermode-test shim used by
+    /// [`KAlloc::allocate`].
     ///
     /// # Parameters
-    /// - `size`: the number of bytes to allocate. Unlike [`KAlloc::allocate`],
-    ///   `0` is not special-cased here and is forwarded to `ExAllocatePool2`
-    ///   as-is.
+    /// - `size`: the number of bytes to allocate. A zero-size request never
+    ///   reaches the pool: `ExAllocatePool2` documents `NumberOfBytes` as
+    ///   "a non-zero number of bytes", and lists only memory exhaustion and
+    ///   a bad tag or flags as reasons it returns null — so it defines no
+    ///   behaviour at all for `0`. This returns null instead.
     ///
     /// # Returns
-    /// A pointer to the allocated memory, or a null pointer if the allocation
-    /// fails.
+    /// A pointer to the allocated memory, or a null pointer if `size` is `0`
+    /// or the allocation fails.
     ///
     /// # Examples
     /// ```no_run
@@ -253,9 +263,11 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// ```
     #[inline(always)]
     pub fn kernel_allocate(size: usize) -> *mut u8 {
-        unsafe {
-            ExAllocatePool2(ALLOC_POOL_FLAGS, size, MEMORY_TAG) as *mut u8
+        if size == 0 {
+            return null_mut();
         }
+
+        unsafe { ExAllocatePool2(ALLOC_POOL_FLAGS, size, MEMORY_TAG) as *mut u8 }
     }
 
     /// Allocates `size` bytes, returning a null pointer for a zero-size
@@ -264,6 +276,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Under `#[cfg(test)]`, allocation is redirected to the ordinary
     /// usermode heap so this crate's own tests can exercise the allocator's
     /// logic without a kernel; otherwise this calls [`KAlloc::kernel_allocate`].
+    ///
+    /// The zero-size check lives in each backend rather than here, so the
+    /// shipped path performs it once instead of twice.
     ///
     /// # Parameters
     /// - `size`: the number of bytes to allocate.
@@ -284,10 +299,6 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// unsafe { Alloc::deallocate(ptr) };
     /// ```
     pub fn allocate(size: usize) -> *mut u8 {
-        if size == 0 {
-            return null_mut();
-        }
-
         #[cfg(test)]
         {
             Self::usermode_allocate(size)
@@ -374,6 +385,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// A pointer to memory satisfying `layout`, or a null pointer on
     /// allocation failure.
     ///
+    /// A zero-size `layout` always returns a null pointer, and never reaches
+    /// the pool. [`GlobalAlloc`] calls a zero-size request undefined
+    /// behaviour but invites implementations to "guarantee a sentinel address
+    /// or a null pointer in response to a zero-size allocation request" —
+    /// this is that guarantee. Callers needing a usable pointer for an empty
+    /// allocation want the [`Allocator`] impl, which returns a dangling one
+    /// as that trait requires.
+    ///
     /// # Note
     /// A pointer returned from this function when realignment was required
     /// cannot be freed with the plain [`KAlloc::deallocate`] — that function
@@ -401,6 +420,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// unsafe { Alloc::deallocate_aligned(ptr, layout) };
     /// ```
     pub fn allocate_aligned(layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            return null_mut();
+        }
+
         if Self::is_kernel_aligned(layout) {
             Self::allocate(layout.size())
         } else {
@@ -431,6 +454,20 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///   zero-size request to a null pointer. The [`Allocator::allocate`]
     ///   implementation documents that case in full.
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            // Allocator, unlike GlobalAlloc, requires zero-sized allocations
+            // to succeed, and ExAllocatePool2 has no defined behaviour for a
+            // zero-size request — so this must not reach the pool. A dangling
+            // but correctly aligned pointer is exactly what the contract asks
+            // for, and deallocate_aligned discards it without freeing.
+            let dangling = without_provenance_mut::<u8>(layout.align());
+            let empty = slice_from_raw_parts_mut(dangling, 0);
+
+            // SAFETY: layout.align() is a non-zero power of two, so the
+            // address is non-null.
+            return Ok(unsafe { NonNull::new_unchecked(empty) });
+        }
+
         let allocated_raw = Self::allocate_aligned(layout);
 
         if allocated_raw.is_null() {
@@ -566,6 +603,13 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return;
         }
 
+        if layout.size() == 0 {
+            // Nothing was ever taken from the pool for a zero-size layout:
+            // allocate_aligned returns null, and allocate_slice returns a
+            // dangling pointer. Either way there is nothing to give back.
+            return;
+        }
+
         let original_ptr = if Self::is_kernel_aligned(layout) {
             ptr
         } else {
@@ -600,6 +644,10 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// must have non-zero size, and the caller must pass the exact same
     /// `layout` to [`GlobalAlloc::dealloc`] (or `realloc`) when freeing the
     /// returned pointer.
+    ///
+    /// Should a zero-size `layout` arrive anyway, this returns null rather
+    /// than reaching `ExAllocatePool2`, which documents no behaviour for a
+    /// zero-size request. See [`KAlloc::allocate_aligned`].
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::allocate_aligned(layout)
     }
@@ -631,13 +679,12 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// - `Ok(_)` — a `NonNull<[u8]>` slice of exactly `layout.size()` bytes
     ///   (never more, even though the real underlying allocation may be
     ///   larger than that once realignment padding is accounted for).
-    /// - `Err(AllocError)` — if the underlying pool allocation fails, or if
-    ///   `layout.size()` is `0` *and* `layout.align()` is no greater than
-    ///   [`MIN_ALIGNMENT`] — in that case [`KAlloc::allocate`] short-circuits
-    ///   to a null pointer, reported here as an error rather than a dangling
-    ///   pointer. A zero-size layout with a *larger* alignment instead takes
-    ///   the over-allocation path in [`KAlloc::allocate_aligned`] and
-    ///   returns a real, non-null (if functionally empty) allocation.
+    /// - `Ok(_)` — for a zero-size `layout`, a dangling pointer aligned to
+    ///   `layout.align()` with a length of `0`. [`Allocator`] requires
+    ///   zero-sized allocations to succeed, unlike [`GlobalAlloc`], and the
+    ///   pool is never involved. Passing it back to
+    ///   [`Allocator::deallocate`] is correct and does nothing.
+    /// - `Err(AllocError)` — only if the underlying pool allocation fails.
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         Self::allocate_slice(layout)
     }
@@ -881,5 +928,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn zero_size_allocations_never_reach_the_pool() {
+        // ExAllocatePool2 documents NumberOfBytes as non-zero and defines no
+        // behaviour for 0, so every entry point has to stop short of it.
+        assert!(PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate(0).is_null());
+
+        for alignment in [1usize, 8, MIN_ALIGNMENT, 32, PAGE_SIZE as usize] {
+            let layout = Layout::from_size_align(0, alignment).unwrap();
+            let ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
+
+            assert!(
+                ptr.is_null(),
+                "alignment {alignment}: a zero-size request must not allocate"
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_accepts_zero_sized_layouts() {
+        // Allocator, unlike GlobalAlloc, requires these to succeed. Freeing
+        // the dangling pointer again must be a no-op rather than a crash.
+        for alignment in [1usize, 8, MIN_ALIGNMENT, 32, PAGE_SIZE as usize] {
+            let layout = Layout::from_size_align(0, alignment).unwrap();
+            let allocated = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_slice(layout);
+
+            let slice = allocated
+                .unwrap_or_else(|_| panic!("alignment {alignment}: zero-size layout was rejected"));
+
+            assert_eq!(slice.len(), 0, "alignment {alignment}: length must be 0");
+            assert_eq!(
+                slice.as_ptr().cast::<u8>() as usize % alignment,
+                0,
+                "alignment {alignment}: dangling pointer must still be aligned"
+            );
+
+            // SAFETY: came from allocate_slice with this exact layout.
+            unsafe {
+                PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(
+                    slice.as_ptr().cast::<u8>(),
+                    layout,
+                )
+            };
+        }
+    }
+
+    #[test]
+    fn allocator_grow_from_zero_and_shrink_to_zero() {
+        // The default grow/shrink implementations allocate, copy, then free the
+        // old block -- so a zero-size layout reaches deallocate from a path the
+        // direct tests never take.
+        let allocator = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::default();
+        let empty_layout = Layout::from_size_align(0, MIN_ALIGNMENT).unwrap();
+        let full_layout = Layout::from_size_align(64, MIN_ALIGNMENT).unwrap();
+
+        let empty = allocator
+            .allocate(empty_layout)
+            .expect("zero-size allocate");
+        assert_eq!(empty.len(), 0);
+
+        // Growing away from the dangling pointer must not try to free it.
+        let grown = unsafe { allocator.grow(empty.cast(), empty_layout, full_layout) }
+            .expect("grow from zero");
+        assert_eq!(grown.len(), 64);
+
+        // Shrinking to zero must still release the real allocation.
+        let shrunk = unsafe { allocator.shrink(grown.cast(), full_layout, empty_layout) }
+            .expect("shrink to zero");
+        assert_eq!(shrunk.len(), 0);
+
+        unsafe { allocator.deallocate(shrunk.cast(), empty_layout) };
+    }
+
+    #[test]
+    fn allocator_zeroed_accepts_zero_sized_layouts() {
+        let allocator = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::default();
+        let layout = Layout::from_size_align(0, 32).unwrap();
+
+        let empty = allocator
+            .allocate_zeroed(layout)
+            .expect("zero-size allocate_zeroed");
+
+        assert_eq!(empty.len(), 0);
+        unsafe { allocator.deallocate(empty.cast(), layout) };
+    }
+
+    #[test]
+    fn kernel_allocate_guards_zero_without_reaching_the_pool() {
+        // kernel_allocate has no cfg(test) shim, so this genuinely calls the
+        // shipped code path. It is safe to run in a test binary for exactly
+        // one argument: 0, where the guard returns before ExAllocatePool2.
+        // Remove the guard and this reaches the pool from user mode and dies.
+        assert!(PagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(0).is_null());
     }
 }
