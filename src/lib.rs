@@ -314,6 +314,18 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// alignment the kernel pool allocator natively guarantees for
     /// `layout.size()` (see [`KAlloc::kernel_alignment`]), meaning no
     /// over-allocation/realignment is needed to satisfy it.
+    ///
+    /// This runs twice per allocation: once in [`KAlloc::allocate_aligned`] to
+    /// decide whether to stash the pool's own pointer, and again in
+    /// [`KAlloc::deallocate_aligned`] to decide whether to read it back. The
+    /// two answers must agree — if the free path decides "not stashed" for a
+    /// pointer that was, it hands `ExFreePool` an address inside the block and
+    /// corrupts the pool.
+    ///
+    /// Agreement is not automatic, because this depends on `layout.size()` and
+    /// [`Allocator::deallocate`] accepts any size that *fits* rather than the
+    /// exact one. Two separate properties currently guarantee it; both are
+    /// checked by `free_path_decision_cannot_flip`.
     #[inline(always)]
     fn is_kernel_aligned(layout: Layout) -> bool {
         let pool_alignment = Self::kernel_alignment(layout.size());
@@ -436,6 +448,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             // SAFETY: Layout guarantees a non-zero power-of-two alignment.
             let alignment = unsafe { NonZeroUsize::new_unchecked(layout.align()) };
             let aligned = Self::align_up_to(buffer, alignment);
+
+            debug_assert!(
+                (aligned as usize).saturating_add(layout.size())
+                    <= (buffer as usize).saturating_add(extended_buffer_size),
+                "the realigned region must fit inside the block actually allocated"
+            );
+            debug_assert!(
+                (aligned as usize) - (buffer as usize) >= POINTER_SIZE,
+                "the gap must be wide enough to hold the stashed pointer"
+            );
+
             Self::save_original_pointer(aligned, buffer);
 
             aligned
@@ -473,6 +496,13 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         if allocated_raw.is_null() {
             Err(AllocError)
         } else {
+            // Exactly layout.size(), never the larger block really taken from
+            // the pool. Allocator permits reporting more, but whatever is
+            // reported becomes `max` in the range of sizes that
+            // Allocator::deallocate will then accept — and the free path
+            // recomputes the stash decision from the size it is handed. Keeping
+            // max == min leaves callers one legal size and no way to move that
+            // decision. This line is load-bearing; see is_kernel_aligned.
             let allocated_slice = slice_from_raw_parts_mut(allocated_raw, layout.size());
 
             Ok(unsafe { NonNull::new_unchecked(allocated_slice) })
@@ -1022,5 +1052,64 @@ mod tests {
         // one argument: 0, where the guard returns before ExAllocatePool2.
         // Remove the guard and this reaches the pool from user mode and dies.
         assert!(PagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(0).is_null());
+    }
+
+    /// Pins the one property that keeps the allocate/free stash decision
+    /// consistent: [`KAlloc::allocate_slice`] reports exactly `layout.size()`,
+    /// so `min == max` in the range [`Allocator::deallocate`] accepts and a
+    /// caller has exactly one legal size to free with.
+    ///
+    /// The reported size is read back from `allocate_slice` rather than
+    /// assumed, so reporting the larger block really taken from the pool —
+    /// which the `Allocator` contract permits — widens the range here and
+    /// fails the flip check below.
+    ///
+    /// This does *not* guard the `size + align` over-allocation; that is
+    /// checked by the `debug_assert!`s inside [`KAlloc::allocate_aligned`],
+    /// which is the only place both values are in scope.
+    #[test]
+    fn free_path_decision_cannot_flip() {
+        type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+        let page = PAGE_SIZE as usize;
+
+        for shift in 0..14u32 {
+            let align = 1usize << shift;
+            let bands = (1..=3).flat_map(|m| (m * page - 2)..=(m * page + 2));
+
+            for size in (1usize..=200).chain(bands) {
+                let Ok(layout) = Layout::from_size_align(size, align) else {
+                    continue;
+                };
+                let stashed = !Alloc::is_kernel_aligned(layout);
+
+                // Observed, not derived: this is the `max` of the fitting range.
+                let slice = Alloc::allocate_slice(layout).expect("allocation");
+                let reported = slice.len();
+                // SAFETY: came from allocate_slice with this exact layout.
+                unsafe { Alloc::deallocate_aligned(slice.as_ptr().cast::<u8>(), layout) };
+
+                assert_eq!(
+                    reported, size,
+                    "size {size} align {align}: allocate_slice must report the                      requested size, or the fitting range widens"
+                );
+
+                // Walk every size in min..=max that could change the answer.
+                let mut probe = size;
+                while let Ok(other) = Layout::from_size_align(probe, align) {
+                    assert_eq!(
+                        !Alloc::is_kernel_aligned(other),
+                        stashed,
+                        "size {size} align {align}: freeing with size {probe}                          (legal, max is {reported}) flips the stash decision"
+                    );
+                    if probe >= reported {
+                        break;
+                    }
+                    probe = ((probe / page) + 1) * page;
+                    if probe > reported {
+                        probe = reported;
+                    }
+                }
+            }
+        }
     }
 }
