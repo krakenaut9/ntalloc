@@ -383,7 +383,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Returns
     /// The next address after `allocated_buffer` that is a multiple of
-    /// `alignment`.
+    /// `alignment`, as a pointer still derived from `allocated_buffer` and
+    /// therefore still carrying its provenance.
     ///
     /// # Note
     /// Does not check for address overflow; with overflow checks disabled
@@ -400,7 +401,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
         let alignment = alignment.get();
         let alignment_mask_base = !(alignment - 1);
-        ((allocated_buffer as usize & alignment_mask_base) + alignment) as *mut u8
+
+        // `map_addr` rather than a cast through `usize`: it produces the same
+        // address but keeps the result derived from `allocated_buffer`, so the
+        // pointer still carries provenance over the pool block it points into.
+        // Casting out to an integer and back drops that lineage, leaving the
+        // compiler to guess which allocation was meant — defined under
+        // exposed provenance, but the one construct Miri cannot check.
+        allocated_buffer.map_addr(|addr| (addr & alignment_mask_base) + alignment)
     }
 
     /// Allocates memory satisfying `layout`, handling alignment requirements
