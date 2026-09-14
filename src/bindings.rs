@@ -6,6 +6,13 @@
 /// Type of the pool-selection flags passed to `ExAllocatePool2`.
 pub type POOL_FLAGS = u64;
 
+/// Skip the zero-initialization `ExAllocatePool2` otherwise performs (`0x2`).
+///
+/// Per the WDK, kernel-mode drivers should not opt out of zeroing for memory
+/// that will be copied anywhere untrusted — user mode, the network — since
+/// whatever the pool block last held would go with it.
+pub const POOL_FLAG_UNINITIALIZED: POOL_FLAGS = 2;
+
 /// Allocate from non-paged pool (`0x40`).
 pub const POOL_FLAG_NON_PAGED: POOL_FLAGS = 64;
 /// Allocate from paged pool (`0x100`).

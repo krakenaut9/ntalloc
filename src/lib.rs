@@ -60,7 +60,7 @@ extern crate alloc;
 
 mod bindings;
 
-use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAGS};
+use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_UNINITIALIZED, POOL_FLAGS};
 use alloc::alloc::{AllocError, Allocator};
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -138,6 +138,19 @@ pub const MIN_ALIGNMENT: usize = POINTER_SIZE * 2;
 impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
+    /// Whether allocations from this configuration arrive zero-initialized.
+    ///
+    /// `ExAllocatePool2` zeroes every block it returns unless
+    /// `POOL_FLAG_UNINITIALIZED` is among `ALLOC_POOL_FLAGS`, so this is a
+    /// property of the type, resolved at compile time. It is `true` for
+    /// [`PagedAlloc`] and [`NonPagedAlloc`].
+    ///
+    /// The [`GlobalAlloc::alloc_zeroed`] and [`Allocator::allocate_zeroed`]
+    /// implementations consult it to skip the redundant second pass their
+    /// default implementations would otherwise make over memory the pool has
+    /// already zeroed.
+    pub const POOL_ZEROES: bool = (ALLOC_POOL_FLAGS & POOL_FLAG_UNINITIALIZED) == 0;
+
     /// Returns the address, one pointer-width before `ptr`, where the
     /// original (pre-alignment) pointer is stored by
     /// [`KAlloc::save_original_pointer`].
@@ -224,6 +237,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Guards zero exactly as [`KAlloc::kernel_allocate`] does — `alloc` has
     /// the same non-zero requirement `ExAllocatePool2` has — so that the
     /// shipped path carries no check its backend already makes.
+    ///
+    /// Mirrors the pool's zeroing too, via [`KAlloc::POOL_ZEROES`]. `alloc`
+    /// promises nothing about initialization while `ExAllocatePool2` always
+    /// zeroes, so without this the tests would exercise a backend that
+    /// behaves differently from the shipped one on exactly the property
+    /// [`GlobalAlloc::alloc_zeroed`] depends on.
     #[cfg(test)]
     #[inline(always)]
     fn usermode_allocate(size: usize) -> *mut u8 {
@@ -231,11 +250,15 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return null_mut();
         }
 
+        let layout = Layout::from_size_align(size, Self::kernel_alignment(size))
+            .expect("Failed to create layout");
+
         unsafe {
-            alloc::alloc::alloc(
-                Layout::from_size_align(size, Self::kernel_alignment(size))
-                    .expect("Failed to create layout"),
-            )
+            if Self::POOL_ZEROES {
+                alloc::alloc::alloc_zeroed(layout)
+            } else {
+                alloc::alloc::alloc(layout)
+            }
         }
     }
 
@@ -582,20 +605,18 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// the original layout to deallocate correctly.
     #[cfg(test)]
     fn usermode_deallocate(original_ptr: *mut u8, layout: Layout) {
-        let allocated_size = layout.size() + if Self::is_kernel_aligned(layout) {
-            0
-        } else {
-            layout.align()
-        };
+        let allocated_size = layout.size()
+            + if Self::is_kernel_aligned(layout) {
+                0
+            } else {
+                layout.align()
+            };
 
         unsafe {
             alloc::alloc::dealloc(
                 original_ptr,
-                Layout::from_size_align(
-                    allocated_size,
-                    Self::kernel_alignment(allocated_size),
-                )
-                .expect("Failed to create layout"),
+                Layout::from_size_align(allocated_size, Self::kernel_alignment(allocated_size))
+                    .expect("Failed to create layout"),
             );
         }
     }
@@ -696,6 +717,38 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
         // contract already requires exactly what deallocate_aligned does.
         unsafe { Self::deallocate_aligned(ptr, layout) };
     }
+
+    /// Allocates zero-initialized memory satisfying `layout`.
+    ///
+    /// The default implementation of this method allocates and then writes
+    /// zeroes over the whole block. `ExAllocatePool2` has already done that,
+    /// so when [`KAlloc::POOL_ZEROES`] holds this simply returns the
+    /// allocation and the second pass is skipped — the condition is a const,
+    /// so only one branch survives compilation.
+    ///
+    /// For an over-aligned request the returned region still arrives zeroed:
+    /// it lies inside the larger block the pool zeroed, and the pointer
+    /// [`KAlloc::allocate_aligned`] stashes goes in the bytes *before* it.
+    ///
+    /// # Safety
+    /// As [`GlobalAlloc::alloc`]: `layout` must have non-zero size, and the
+    /// same `layout` must come back on the free path.
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = Self::allocate_aligned(layout);
+
+        // The left operand is a const, so when the pool zeroes this whole
+        // branch — the null test included — is compiled away. When it does
+        // not, null still has to be excluded: it means the allocation failed
+        // or `layout` was zero-sized (see [`KAlloc::allocate_aligned`]), and
+        // null is not a valid write target even for a zero-length write.
+        if !Self::POOL_ZEROES && !ptr.is_null() {
+            // SAFETY: the allocation succeeded, so layout.size() bytes from
+            // `ptr` are valid for writes.
+            unsafe { ptr.write_bytes(0, layout.size()) };
+        }
+
+        ptr
+    }
 }
 
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
@@ -717,6 +770,29 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// - `Err(AllocError)` — only if the underlying pool allocation fails.
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         Self::allocate_slice(layout)
+    }
+
+    /// Allocates zero-initialized memory satisfying `layout`.
+    ///
+    /// Skips the second zeroing pass the default implementation would make
+    /// whenever [`KAlloc::POOL_ZEROES`] holds, for the reasons given on
+    /// [`GlobalAlloc::alloc_zeroed`]. A zero-sized `layout` yields the same
+    /// dangling, length-`0` slice [`Allocator::allocate`] returns, which is
+    /// trivially zeroed.
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let allocated = Self::allocate_slice(layout)?;
+
+        if !Self::POOL_ZEROES {
+            // SAFETY: allocate_slice returned a block of exactly this length.
+            unsafe {
+                allocated
+                    .cast::<u8>()
+                    .as_ptr()
+                    .write_bytes(0, allocated.len())
+            };
+        }
+
+        Ok(allocated)
     }
 
     /// Frees a pointer previously returned by [`Allocator::allocate`] (or
@@ -1109,6 +1185,227 @@ mod tests {
                         probe = reported;
                     }
                 }
+            }
+        }
+    }
+
+    /// Dirties a block, releases it, then takes the same shape again and
+    /// checks every byte reads zero. Recycling is what makes this meaningful:
+    /// a fresh block from the OS is zero anyway, so only a reused one proves
+    /// the allocator itself zeroes.
+    #[test]
+    fn allocations_come_back_zeroed() {
+        type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+        const { assert!(Alloc::POOL_ZEROES, "the default aliases must zero") };
+
+        for &(size, align) in &[(256usize, 16usize), (256, 64), (100, 4096), (4096, 4096)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+
+            let first = Alloc::allocate_aligned(layout);
+            assert!(!first.is_null());
+            // SAFETY: `size` bytes from `first` are ours.
+            unsafe { first.write_bytes(0xAB, size) };
+            // SAFETY: `first` came from allocate_aligned with this layout.
+            unsafe { Alloc::deallocate_aligned(first, layout) };
+
+            let second = Alloc::allocate_aligned(layout);
+            assert!(!second.is_null());
+            // SAFETY: `size` bytes from `second` are ours.
+            let dirty = (0..size)
+                .filter(|i| unsafe { *second.add(*i) } != 0)
+                .count();
+            // SAFETY: `second` came from allocate_aligned with this layout.
+            unsafe { Alloc::deallocate_aligned(second, layout) };
+
+            assert_eq!(
+                dirty, 0,
+                "size {size} align {align}: {dirty} bytes were not zeroed"
+            );
+        }
+    }
+
+    /// The stashed pointer lives in the bytes *before* the returned address,
+    /// so it must not appear inside the region handed to the caller. This is
+    /// the case where skipping the second zeroing pass could plausibly leak
+    /// something.
+    #[test]
+    fn realignment_stash_stays_out_of_the_zeroed_region() {
+        type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+
+        for &(size, align) in &[(64usize, 64usize), (100, 128), (16, 4096)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            assert!(!Alloc::is_kernel_aligned(layout), "case must realign");
+
+            let ptr = Alloc::allocate_aligned(layout);
+            assert!(!ptr.is_null());
+
+            let original = Alloc::original_pointer(ptr);
+            assert!(original < ptr, "the stash must precede the region");
+
+            // SAFETY: `size` bytes from `ptr` are ours.
+            let dirty = (0..size).filter(|i| unsafe { *ptr.add(*i) } != 0).count();
+            // SAFETY: `ptr` came from allocate_aligned with this layout.
+            unsafe { Alloc::deallocate_aligned(ptr, layout) };
+
+            assert_eq!(dirty, 0, "size {size} align {align}: region was not zeroed");
+        }
+    }
+
+    /// Both zeroing entry points must honour their guarantee, whichever
+    /// branch of [`KAlloc::POOL_ZEROES`] is compiled in.
+    #[test]
+    fn zeroing_entry_points_honour_their_guarantee() {
+        type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+        let allocator = Alloc::default();
+
+        for &(size, align) in &[(256usize, 16usize), (256, 64), (4096, 4096)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+
+            // GlobalAlloc::alloc_zeroed
+            // SAFETY: layout has non-zero size, and the same layout is used to free.
+            let ptr = unsafe { allocator.alloc_zeroed(layout) };
+            assert!(!ptr.is_null());
+            // SAFETY: `size` bytes from `ptr` are ours.
+            let dirty = (0..size).filter(|i| unsafe { *ptr.add(*i) } != 0).count();
+            // SAFETY: `ptr` came from alloc_zeroed with this layout.
+            unsafe { allocator.dealloc(ptr, layout) };
+            assert_eq!(dirty, 0, "alloc_zeroed left {dirty} non-zero bytes");
+
+            // Allocator::allocate_zeroed
+            let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
+            assert_eq!(slice.len(), size);
+            let base = slice.as_ptr().cast::<u8>();
+            // SAFETY: `size` bytes from `base` are ours.
+            let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
+            // SAFETY: came from allocate_zeroed with this layout.
+            unsafe { allocator.deallocate(slice.cast(), layout) };
+            assert_eq!(dirty, 0, "allocate_zeroed left {dirty} non-zero bytes");
+        }
+    }
+
+    /// Exercises the other branch of [`KAlloc::POOL_ZEROES`]. A configuration
+    /// carrying `POOL_FLAG_UNINITIALIZED` gets no zeroing from the pool, so
+    /// the zeroing entry points have to do it themselves — this is the branch
+    /// that keeps the override from becoming a soundness hole, and no other
+    /// test reaches it.
+    #[test]
+    fn an_uninitialized_pool_still_zeroes_where_it_promises_to() {
+        type Uninit =
+            KAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
+        const {
+            assert!(
+                !Uninit::POOL_ZEROES,
+                "this configuration opts out of zeroing"
+            )
+        };
+
+        let allocator = Uninit::default();
+        let size = 512usize;
+        let layout = Layout::from_size_align(size, 64).unwrap();
+
+        // Dirty and release, so the next request is served from recycled,
+        // non-zero memory rather than a fresh page.
+        let dirtied = Uninit::allocate_aligned(layout);
+        assert!(!dirtied.is_null());
+        // SAFETY: `size` bytes from `dirtied` are ours.
+        unsafe { dirtied.write_bytes(0xAB, size) };
+        // SAFETY: `dirtied` came from allocate_aligned with this layout.
+        unsafe { Uninit::deallocate_aligned(dirtied, layout) };
+
+        // SAFETY: layout has non-zero size and the same one frees it.
+        let ptr = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        // SAFETY: `size` bytes from `ptr` are ours.
+        let dirty = (0..size).filter(|i| unsafe { *ptr.add(*i) } != 0).count();
+        // SAFETY: `ptr` came from alloc_zeroed with this layout.
+        unsafe { allocator.dealloc(ptr, layout) };
+        assert_eq!(dirty, 0, "alloc_zeroed left {dirty} bytes unzeroed");
+
+        // Dirty again: allocate_zeroed must be shown to zero on its own, not
+        // to inherit a block the previous assertion already cleaned.
+        let dirtied = Uninit::allocate_aligned(layout);
+        assert!(!dirtied.is_null());
+        // SAFETY: `size` bytes from `dirtied` are ours.
+        unsafe { dirtied.write_bytes(0xCD, size) };
+        // SAFETY: `dirtied` came from allocate_aligned with this layout.
+        unsafe { Uninit::deallocate_aligned(dirtied, layout) };
+
+        let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
+        let base = slice.as_ptr().cast::<u8>();
+        // SAFETY: `size` bytes from `base` are ours.
+        let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
+        // SAFETY: came from allocate_zeroed with this layout.
+        unsafe { allocator.deallocate(slice.cast(), layout) };
+        assert_eq!(dirty, 0, "allocate_zeroed left {dirty} bytes unzeroed");
+    }
+
+    /// Covers the zero-size corner of both zeroing entry points, under both
+    /// values of [`KAlloc::POOL_ZEROES`].
+    ///
+    /// The interesting cell is [`Allocator::allocate_zeroed`] with a zero-size
+    /// layout on a pool that does not zero: the block it gets back is the
+    /// dangling, no-provenance pointer [`Allocator::allocate`] synthesises,
+    /// and it then writes `0` bytes through it. That is sound — a
+    /// no-provenance pointer may be used for zero-sized accesses when
+    /// suitably aligned — but it is the one place the two features meet, so
+    /// it is pinned here rather than left to inference.
+    #[test]
+    fn zero_size_meets_the_zeroing_paths() {
+        type Zeroing = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+        type NonZeroing =
+            KAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
+        const { assert!(Zeroing::POOL_ZEROES) };
+        const { assert!(!NonZeroing::POOL_ZEROES) };
+
+        for align in [1usize, 8, MIN_ALIGNMENT, 64, PAGE_SIZE as usize] {
+            let layout = Layout::from_size_align(0, align).unwrap();
+
+            // GlobalAlloc::alloc_zeroed -- null for a zero-size layout, and no
+            // write is attempted through it on either configuration.
+            // SAFETY: a zero-size layout breaks GlobalAlloc's contract, but
+            // this implementation defines it as null rather than reaching the
+            // pool; nothing is dereferenced.
+            let zeroing = unsafe { Zeroing::default().alloc_zeroed(layout) };
+            // SAFETY: as above.
+            let non_zeroing = unsafe { NonZeroing::default().alloc_zeroed(layout) };
+            assert!(
+                zeroing.is_null(),
+                "align {align}: alloc_zeroed must be null"
+            );
+            assert!(
+                non_zeroing.is_null(),
+                "align {align}: alloc_zeroed must be null without pool zeroing"
+            );
+
+            // Allocator::allocate_zeroed -- succeeds with a dangling, aligned,
+            // length-0 slice on both, and the non-zeroing one writes 0 bytes
+            // through a no-provenance pointer on the way.
+            let zeroing_slice = Zeroing::default()
+                .allocate_zeroed(layout)
+                .expect("zero-size allocate_zeroed on a zeroing pool");
+            // This one writes 0 bytes through the no-provenance pointer.
+            let non_zeroing_slice = NonZeroing::default()
+                .allocate_zeroed(layout)
+                .expect("zero-size allocate_zeroed on a non-zeroing pool");
+
+            for (label, slice) in [
+                ("zeroing", zeroing_slice),
+                ("non-zeroing", non_zeroing_slice),
+            ] {
+                assert_eq!(slice.len(), 0, "align {align} ({label}): length must be 0");
+                assert_eq!(
+                    slice.as_ptr().cast::<u8>() as usize % align,
+                    0,
+                    "align {align} ({label}): pointer must still be aligned"
+                );
+            }
+
+            // Freeing is a no-op for a zero-size layout on any configuration,
+            // but each block goes back through the allocator that made it.
+            // SAFETY: both came from allocate_zeroed with this exact layout.
+            unsafe {
+                Zeroing::deallocate_aligned(zeroing_slice.as_ptr().cast::<u8>(), layout);
+                NonZeroing::deallocate_aligned(non_zeroing_slice.as_ptr().cast::<u8>(), layout);
             }
         }
     }
