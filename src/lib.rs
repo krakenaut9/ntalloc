@@ -825,22 +825,24 @@ mod tests {
     #[test]
     fn require_realignment_test() {
         let size = 16;
-        let alignments = (0..=16).map(|i| 1 << i).collect::<Vec<usize>>();
-        for &alignment in alignments.iter() {
+
+        for shift in 0..=16u32 {
+            let alignment = 1usize << shift;
             let layout = Layout::from_size_align(size, alignment).unwrap();
-            let requires_realignment =
+            // is_kernel_aligned is true when the pool already satisfies the
+            // layout, i.e. when no realignment is needed.
+            let already_satisfied =
                 PagedAlloc::<DEFAULT_MEMORY_TAG, true>::is_kernel_aligned(layout);
+
             if alignment <= MIN_ALIGNMENT {
                 assert!(
-                    requires_realignment,
-                    "Expected realignment for alignment {} but got false",
-                    alignment
+                    already_satisfied,
+                    "alignment {alignment} is within MIN_ALIGNMENT, so the pool                      should already satisfy it and no realignment is needed"
                 );
             } else {
                 assert!(
-                    !requires_realignment,
-                    "Expected no realignment for alignment {} but got true",
-                    alignment
+                    !already_satisfied,
+                    "alignment {alignment} exceeds what the pool guarantees for                      a {size}-byte request, so realignment is needed"
                 );
             }
         }
