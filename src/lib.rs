@@ -63,7 +63,7 @@ mod bindings;
 use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_UNINITIALIZED, POOL_FLAGS};
 use alloc::alloc::{AllocError, Allocator};
 use core::{
-    alloc::{GlobalAlloc, Layout},
+    alloc::{AllocatorClone, GlobalAlloc, Layout, StaticAllocator},
     num::NonZeroUsize,
     ptr::{NonNull, null_mut, slice_from_raw_parts_mut, without_provenance_mut},
 };
@@ -815,6 +815,42 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
         // contract already requires exactly what deallocate_aligned does.
         unsafe { Self::deallocate_aligned(ptr.as_ptr(), layout) };
     }
+}
+
+// SAFETY: [`StaticAllocator`] asks that nothing about the allocator's own
+// lifetime can invalidate memory it handed out. For [`KAlloc`]:
+//
+// - it has no `Drop` impl, so dropping one releases nothing;
+// - it is a zero-sized type holding no state;
+// - its lifetime expiring frees nothing, because it owns nothing;
+// - nothing reachable from safe code can invalidate an allocation. The safe
+//   public surface is [`KAlloc::POOL_ZEROES`], [`KAlloc::kernel_alignment`],
+//   [`KAlloc::kernel_allocate`], [`KAlloc::allocate`] and
+//   [`KAlloc::allocate_aligned`], none of which free anything. Of the five
+//   functions that do return memory, two are `unsafe`
+//   ([`KAlloc::deallocate`] and [`KAlloc::deallocate_aligned`]) and the other
+//   three are private and called only from inside those two;
+// - all of the above hold for every equivalent allocator, since instances
+//   sharing the same const parameters are indistinguishable.
+//
+// A pool block therefore stays valid until the matching `ExFreePool` or
+// `ExFreePoolWithTag`, regardless of what happens to the allocator value.
+unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
+    StaticAllocator for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+{
+}
+
+// SAFETY: [`AllocatorClone`] asks that a clone be interchangeable with the
+// original, so that either can free what the other allocated. [`KAlloc`] is a
+// zero-sized type carrying no state: the pool, the tag and the free routine all
+// come from its const parameters, so two values of the same type forward to the
+// same pool calls identically. Moving or dropping one frees nothing, so blocks
+// stay valid while clones live, and the derived `Clone` copies a zero-sized
+// value and cannot unwind. The type is also `Copy`, which preserves that
+// equivalence exactly as cloning does.
+unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
+    AllocatorClone for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+{
 }
 
 #[cfg(test)]
