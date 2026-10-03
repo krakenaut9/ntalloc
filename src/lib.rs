@@ -8,7 +8,7 @@
 //!
 //! # Overview
 //!
-//! - [`KAlloc`] is a zero-sized allocator type parameterized over the pool
+//! - [`NtAlloc`] is a zero-sized allocator type parameterized over the pool
 //!   flags, the memory tag, and whether deallocation uses the tagged or
 //!   untagged free routine.
 //! - [`PagedAlloc`] and [`NonPagedAlloc`] are convenience aliases for the
@@ -22,19 +22,19 @@
 //! `ExAllocatePool2` only guarantees an allocation aligned to
 //! [`MIN_ALIGNMENT`] (the WDK's `MEMORY_ALLOCATION_ALIGNMENT`: two pointers,
 //! i.e. 16 bytes on 64-bit targets), or to the page size for allocations of
-//! at least one page (see [`KAlloc::kernel_alignment`]). Rust [`Layout`]s can
+//! at least one page (see [`NtAlloc::kernel_alignment`]). Rust [`Layout`]s can
 //! request stricter alignment than that, so when a request exceeds what the
-//! pool allocator natively guarantees, [`KAlloc::allocate_aligned`]
+//! pool allocator natively guarantees, [`NtAlloc::allocate_aligned`]
 //! over-allocates by `layout.align()` extra bytes, rounds the returned
 //! pointer up to the requested alignment, and stashes the original
 //! (unaligned) pointer in the pointer-sized slot immediately before the
 //! aligned pointer. There is always room for that slot because
 //! `ExAllocatePool2` never returns a base below [`MIN_ALIGNMENT`], so
 //! rounding up moves the pointer by a multiple of [`MIN_ALIGNMENT`] — two
-//! pointers — and never by less. [`KAlloc::deallocate_aligned`] reads that
+//! pointers — and never by less. [`NtAlloc::deallocate_aligned`] reads that
 //! slot back out to recover the pointer that must be passed to
 //! `ExFreePool`/`ExFreePoolWithTag`, which is why an over-aligned allocation
-//! has to be released through it rather than through [`KAlloc::deallocate`].
+//! has to be released through it rather than through [`NtAlloc::deallocate`].
 //!
 //! # Example
 //!
@@ -83,7 +83,7 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 
 /// A stateless, `#![no_std]`-friendly Windows kernel pool allocator.
 ///
-/// `KAlloc` is a zero-sized type: all of its behavior is selected entirely at
+/// `NtAlloc` is a zero-sized type: all of its behavior is selected entirely at
 /// compile time via its const generic parameters, and every operation is
 /// exposed as an associated function, so no instance ever needs to be
 /// constructed to use them directly. An instance is still needed to satisfy
@@ -96,29 +96,29 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// - `MEMORY_TAG`: the 4-byte pool tag attached to every allocation, used by
 ///   tools such as `!poolused`/`!poolfind` to attribute pool memory back to
 ///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`].
-/// - `TAGGED_DEALLOC`: selects the free routine used by [`KAlloc::deallocate`]:
+/// - `TAGGED_DEALLOC`: selects the free routine used by [`NtAlloc::deallocate`]:
 ///   `true` uses `ExFreePoolWithTag` (the tag must match the one the memory
 ///   was allocated with), `false` uses the untagged `ExFreePool`. Defaults to
 ///   `true`.
 ///
-/// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `KAlloc`
+/// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `NtAlloc`
 /// directly.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct KAlloc<
+pub struct NtAlloc<
     const ALLOC_POOL_FLAGS: POOL_FLAGS,
     const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG,
     const TAGGED_DEALLOC: bool = true,
 >;
 
-/// [`KAlloc`] backed by the paged pool (`POOL_FLAG_PAGED`).
+/// [`NtAlloc`] backed by the paged pool (`POOL_FLAG_PAGED`).
 ///
 /// Memory from the paged pool may be paged out to disk, so it may only be
 /// touched at IRQL `APC_LEVEL` or below — that is, strictly below
 /// `DISPATCH_LEVEL`. Never touch it from a DPC, from an ISR, or while
 /// holding a spin lock.
 pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEALLOC: bool = true> =
-    KAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
-/// [`KAlloc`] backed by the non-paged pool (`POOL_FLAG_NON_PAGED`).
+    NtAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
+/// [`NtAlloc`] backed by the non-paged pool (`POOL_FLAG_NON_PAGED`).
 ///
 /// Non-paged pool memory is always resident and safe to access at any IRQL,
 /// at the cost of being a more constrained system-wide resource than paged
@@ -126,7 +126,7 @@ pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEA
 pub type NonPagedAlloc<
     const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG,
     const TAGGED_DEALLOC: bool = true,
-> = KAlloc<POOL_FLAG_NON_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
+> = NtAlloc<POOL_FLAG_NON_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
 
 /// Size, in bytes, of a pointer on the target platform.
 pub const POINTER_SIZE: usize = size_of::<*const u8>();
@@ -136,7 +136,7 @@ pub const POINTER_SIZE: usize = size_of::<*const u8>();
 pub const MIN_ALIGNMENT: usize = POINTER_SIZE * 2;
 
 impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+    NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
     /// Whether allocations from this configuration arrive zero-initialized.
     ///
@@ -153,9 +153,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Returns the address, one pointer-width before `ptr`, where the
     /// original (pre-alignment) pointer is stored by
-    /// [`KAlloc::save_original_pointer`].
+    /// [`NtAlloc::save_original_pointer`].
     ///
-    /// `ptr` must be a pointer returned by [`KAlloc::allocate_aligned`] for
+    /// `ptr` must be a pointer returned by [`NtAlloc::allocate_aligned`] for
     /// a layout that required realignment; the slot this names is only
     /// guaranteed to exist, and to belong to the caller, for such a pointer.
     /// That restriction is why this is not part of the public API: nothing
@@ -166,12 +166,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     }
 
     /// Stores `original_ptr` in the pointer-sized slot immediately before
-    /// `ptr`, so it can later be recovered by [`KAlloc::original_pointer`]
+    /// `ptr`, so it can later be recovered by [`NtAlloc::original_pointer`]
     /// and passed to the real free routine.
     ///
     /// `ptr` must have at least [`POINTER_SIZE`] bytes of valid, writable
-    /// memory immediately before it. [`KAlloc::allocate_aligned`] guarantees
-    /// that: the gap [`KAlloc::align_up_to`] opens is a multiple of
+    /// memory immediately before it. [`NtAlloc::allocate_aligned`] guarantees
+    /// that: the gap [`NtAlloc::align_up_to`] opens is a multiple of
     /// [`MIN_ALIGNMENT`], which is two pointers wide. `original_ptr` is the
     /// pointer the underlying allocation actually returned, to be restored
     /// on deallocation.
@@ -184,9 +184,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     }
 
     /// Reads back the pointer previously stored by
-    /// [`KAlloc::save_original_pointer`].
+    /// [`NtAlloc::save_original_pointer`].
     ///
-    /// `ptr` must be a pointer returned by [`KAlloc::allocate_aligned`] for
+    /// `ptr` must be a pointer returned by [`NtAlloc::allocate_aligned`] for
     /// which realignment was required; for any other pointer the slot read
     /// here holds unrelated memory.
     #[inline(always)]
@@ -229,16 +229,16 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         }
     }
 
-    /// Test-only stand-in for [`KAlloc::kernel_allocate`]: allocates `size`
+    /// Test-only stand-in for [`NtAlloc::kernel_allocate`]: allocates `size`
     /// bytes from the ordinary usermode heap, so the allocator's alignment
     /// and pointer-stashing logic can be exercised by `cargo test` without a
     /// running kernel.
     ///
-    /// Guards zero exactly as [`KAlloc::kernel_allocate`] does — `alloc` has
+    /// Guards zero exactly as [`NtAlloc::kernel_allocate`] does — `alloc` has
     /// the same non-zero requirement `ExAllocatePool2` has — so that the
     /// shipped path carries no check its backend already makes.
     ///
-    /// Mirrors the pool's zeroing too, via [`KAlloc::POOL_ZEROES`]. `alloc`
+    /// Mirrors the pool's zeroing too, via [`NtAlloc::POOL_ZEROES`]. `alloc`
     /// promises nothing about initialization while `ExAllocatePool2` always
     /// zeroes, so without this the tests would exercise a backend that
     /// behaves differently from the shipped one on exactly the property
@@ -264,7 +264,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Allocates `size` bytes directly from the kernel pool via
     /// `ExAllocatePool2`, bypassing the usermode-test shim used by
-    /// [`KAlloc::allocate`].
+    /// [`NtAlloc::allocate`].
     ///
     /// # Parameters
     /// - `size`: the number of bytes to allocate. A zero-size request never
@@ -298,7 +298,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// Under `#[cfg(test)]`, allocation is redirected to the ordinary
     /// usermode heap so this crate's own tests can exercise the allocator's
-    /// logic without a kernel; otherwise this calls [`KAlloc::kernel_allocate`].
+    /// logic without a kernel; otherwise this calls [`NtAlloc::kernel_allocate`].
     ///
     /// The zero-size check lives in each backend rather than here, so the
     /// shipped path performs it once instead of twice.
@@ -335,12 +335,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Returns whether `layout`'s alignment is already satisfied by whatever
     /// alignment the kernel pool allocator natively guarantees for
-    /// `layout.size()` (see [`KAlloc::kernel_alignment`]), meaning no
+    /// `layout.size()` (see [`NtAlloc::kernel_alignment`]), meaning no
     /// over-allocation/realignment is needed to satisfy it.
     ///
-    /// This runs twice per allocation: once in [`KAlloc::allocate_aligned`] to
+    /// This runs twice per allocation: once in [`NtAlloc::allocate_aligned`] to
     /// decide whether to stash the pool's own pointer, and again in
-    /// [`KAlloc::deallocate_aligned`] to decide whether to read it back. The
+    /// [`NtAlloc::deallocate_aligned`] to decide whether to read it back. The
     /// two answers must agree — if the free path decides "not stashed" for a
     /// pointer that was, it hands `ExFreePool` an address inside the block and
     /// corrupts the pool.
@@ -359,12 +359,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Rounds `allocated_buffer` up to the next address that is a multiple
     /// of `alignment`. The result is always strictly greater than
     /// `allocated_buffer`, even when it was already aligned, which is what
-    /// leaves [`KAlloc::allocate_aligned`] room to stash a pointer just
+    /// leaves [`NtAlloc::allocate_aligned`] room to stash a pointer just
     /// before the address it hands out.
     ///
     /// How much room is not guaranteed by this function alone. For an
     /// arbitrary address the gap can be a single byte, too small to hold a
-    /// pointer. It is sufficient in [`KAlloc::allocate_aligned`] only
+    /// pointer. It is sufficient in [`NtAlloc::allocate_aligned`] only
     /// because the address there comes from `ExAllocatePool2` and is
     /// therefore aligned to at least [`MIN_ALIGNMENT`], while `alignment`
     /// is a larger power of two — so the gap is a multiple of
@@ -414,8 +414,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Allocates memory satisfying `layout`, handling alignment requirements
     /// stronger than what the kernel pool allocator natively provides.
     ///
-    /// If `layout.align()` is no stronger than [`KAlloc::kernel_alignment`]
-    /// for the requested size, this simply forwards to [`KAlloc::allocate`].
+    /// If `layout.align()` is no stronger than [`NtAlloc::kernel_alignment`]
+    /// for the requested size, this simply forwards to [`NtAlloc::allocate`].
     /// Otherwise it over-allocates by `layout.align()` extra bytes, rounds
     /// the result up to `layout.align()`, and
     /// stashes the original pointer just before the returned one (see the
@@ -438,14 +438,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Note
     /// A pointer returned from this function when realignment was required
-    /// cannot be freed with the plain [`KAlloc::deallocate`] — that function
+    /// cannot be freed with the plain [`NtAlloc::deallocate`] — that function
     /// has no way to recover the original pointer. Free it with
-    /// [`KAlloc::deallocate_aligned`], passing the same `layout`, or through
+    /// [`NtAlloc::deallocate_aligned`], passing the same `layout`, or through
     /// this type's [`GlobalAlloc`]/[`Allocator`] implementations, which do
     /// the same thing. (For a pointer that did *not* need realignment,
-    /// [`KAlloc::deallocate`] is fine either way — but since only `layout`
+    /// [`NtAlloc::deallocate`] is fine either way — but since only `layout`
     /// distinguishes the two cases, always pairing with
-    /// [`KAlloc::deallocate_aligned`] is the rule that cannot go wrong.)
+    /// [`NtAlloc::deallocate_aligned`] is the rule that cannot go wrong.)
     ///
     /// # Examples
     /// ```no_run
@@ -497,14 +497,14 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     }
 
     /// Implements the [`Allocator::allocate`] contract: allocates memory for
-    /// `layout` via [`KAlloc::allocate_aligned`] and wraps it as a
+    /// `layout` via [`NtAlloc::allocate_aligned`] and wraps it as a
     /// `NonNull<[u8]>` slice.
     ///
     /// # Returns
     /// - `Ok(_)` — a `NonNull<[u8]>` slice of `layout.size()` bytes.
     /// - `Err(AllocError)` — if the underlying pool allocation fails, and
     ///   also when `layout.size()` is `0` and `layout.align()` is no greater
-    ///   than [`MIN_ALIGNMENT`], since [`KAlloc::allocate`] short-circuits a
+    ///   than [`MIN_ALIGNMENT`], since [`NtAlloc::allocate`] short-circuits a
     ///   zero-size request to a null pointer. The [`Allocator::allocate`]
     ///   implementation documents that case in full.
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -564,27 +564,27 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         }
     }
 
-    /// Frees a pointer previously returned by [`KAlloc::kernel_allocate`] (or
-    /// [`KAlloc::allocate`] outside of tests), using the free routine
+    /// Frees a pointer previously returned by [`NtAlloc::kernel_allocate`] (or
+    /// [`NtAlloc::allocate`] outside of tests), using the free routine
     /// selected by `TAGGED_DEALLOC`.
     ///
     /// This does **not** account for the pointer-stashing done by
-    /// [`KAlloc::allocate_aligned`] for over-aligned requests — see that
+    /// [`NtAlloc::allocate_aligned`] for over-aligned requests — see that
     /// function's documentation for when it is safe to call this directly.
     ///
     /// # Safety
     /// The caller must guarantee all of the following:
     ///
-    /// - `ptr` is non-null. Unlike [`KAlloc::deallocate_aligned`], this
+    /// - `ptr` is non-null. Unlike [`NtAlloc::deallocate_aligned`], this
     ///   function does not check, and `ExFreePool`/`ExFreePoolWithTag`
     ///   bugchecks on a null pointer rather than ignoring it the way C's
     ///   `free` would.
-    /// - `ptr` came from the same `KAlloc` configuration: the same pool
+    /// - `ptr` came from the same `NtAlloc` configuration: the same pool
     ///   flags, the same `MEMORY_TAG`, and the same `TAGGED_DEALLOC`.
     ///   Freeing with a mismatched tag corrupts the pool.
     /// - `ptr` is the address the pool returned, not one that
-    ///   [`KAlloc::allocate_aligned`] adjusted for over-alignment. Those go
-    ///   to [`KAlloc::deallocate_aligned`] instead.
+    ///   [`NtAlloc::allocate_aligned`] adjusted for over-alignment. Those go
+    ///   to [`NtAlloc::deallocate_aligned`] instead.
     /// - `ptr` has not already been freed, and is not used afterwards.
     ///
     /// # Examples
@@ -606,7 +606,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         }
     }
 
-    /// Test-only counterpart to [`KAlloc::usermode_allocate`]: frees a
+    /// Test-only counterpart to [`NtAlloc::usermode_allocate`]: frees a
     /// pointer previously produced by it, reconstructing the exact
     /// [`Layout`] that was used to allocate it (including any extra bytes
     /// added for realignment), since the usermode global allocator requires
@@ -629,11 +629,11 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         }
     }
 
-    /// Frees a pointer returned by [`KAlloc::allocate_aligned`] for `layout`,
+    /// Frees a pointer returned by [`NtAlloc::allocate_aligned`] for `layout`,
     /// recovering and freeing the original (pre-realignment) pointer when
     /// `layout`'s alignment required over-allocation.
     ///
-    /// This is the counterpart to [`KAlloc::allocate_aligned`]: a pointer
+    /// This is the counterpart to [`NtAlloc::allocate_aligned`]: a pointer
     /// from that function must be freed through this one, because for an
     /// over-aligned request the address handed out is not the address the
     /// pool returned, and only this function knows how to recover it.
@@ -643,8 +643,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// # Safety
     /// The caller must guarantee all of the following:
     ///
-    /// - `ptr` was returned by [`KAlloc::allocate_aligned`] on this same
-    ///   `KAlloc` instantiation — the same pool flags, the same
+    /// - `ptr` was returned by [`NtAlloc::allocate_aligned`] on this same
+    ///   `NtAlloc` instantiation — the same pool flags, the same
     ///   `MEMORY_TAG`, and the same `TAGGED_DEALLOC` — or is null.
     /// - `layout` is the *exact* `Layout` that was passed to that call.
     ///   `layout` alone decides whether the original pointer is read back
@@ -694,9 +694,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 }
 
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    GlobalAlloc for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+    GlobalAlloc for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
-    /// Allocates memory satisfying `layout` via [`KAlloc::allocate_aligned`].
+    /// Allocates memory satisfying `layout` via [`NtAlloc::allocate_aligned`].
     ///
     /// # Safety
     /// This method upholds the [`GlobalAlloc::alloc`] contract: `layout`
@@ -706,19 +706,19 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     ///
     /// Should a zero-size `layout` arrive anyway, this returns null rather
     /// than reaching `ExAllocatePool2`, which documents no behaviour for a
-    /// zero-size request. See [`KAlloc::allocate_aligned`].
+    /// zero-size request. See [`NtAlloc::allocate_aligned`].
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::allocate_aligned(layout)
     }
 
     /// Frees a pointer previously returned by [`GlobalAlloc::alloc`] (or
     /// `realloc`) on this same allocator, correctly recovering any pointer
-    /// adjustment [`KAlloc::allocate_aligned`] made for over-aligned
+    /// adjustment [`NtAlloc::allocate_aligned`] made for over-aligned
     /// requests.
     ///
     /// # Safety
     /// `ptr` must have been returned by a prior call to [`GlobalAlloc::alloc`]
-    /// (or `realloc`) on this same `KAlloc` instantiation, and `layout` must
+    /// (or `realloc`) on this same `NtAlloc` instantiation, and `layout` must
     /// be the exact layout used for that allocation.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded straight from GlobalAlloc::dealloc, whose own
@@ -730,13 +730,13 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     ///
     /// The default implementation of this method allocates and then writes
     /// zeroes over the whole block. `ExAllocatePool2` has already done that,
-    /// so when [`KAlloc::POOL_ZEROES`] holds this simply returns the
+    /// so when [`NtAlloc::POOL_ZEROES`] holds this simply returns the
     /// allocation and the second pass is skipped — the condition is a const,
     /// so only one branch survives compilation.
     ///
     /// For an over-aligned request the returned region still arrives zeroed:
     /// it lies inside the larger block the pool zeroed, and the pointer
-    /// [`KAlloc::allocate_aligned`] stashes goes in the bytes *before* it.
+    /// [`NtAlloc::allocate_aligned`] stashes goes in the bytes *before* it.
     ///
     /// # Safety
     /// As [`GlobalAlloc::alloc`]: `layout` must have non-zero size, and the
@@ -747,7 +747,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
         // The left operand is a const, so when the pool zeroes this whole
         // branch — the null test included — is compiled away. When it does
         // not, null still has to be excluded: it means the allocation failed
-        // or `layout` was zero-sized (see [`KAlloc::allocate_aligned`]), and
+        // or `layout` was zero-sized (see [`NtAlloc::allocate_aligned`]), and
         // null is not a valid write target even for a zero-length write.
         if !Self::POOL_ZEROES && !ptr.is_null() {
             // SAFETY: the allocation succeeded, so layout.size() bytes from
@@ -760,9 +760,9 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 }
 
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    Allocator for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+    Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
-    /// Allocates memory satisfying `layout` via [`KAlloc::allocate_aligned`],
+    /// Allocates memory satisfying `layout` via [`NtAlloc::allocate_aligned`],
     /// returning it as a `NonNull<[u8]>` slice per the [`Allocator::allocate`]
     /// contract.
     ///
@@ -783,7 +783,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// Allocates zero-initialized memory satisfying `layout`.
     ///
     /// Skips the second zeroing pass the default implementation would make
-    /// whenever [`KAlloc::POOL_ZEROES`] holds, for the reasons given on
+    /// whenever [`NtAlloc::POOL_ZEROES`] holds, for the reasons given on
     /// [`GlobalAlloc::alloc_zeroed`]. A zero-sized `layout` yields the same
     /// dangling, length-`0` slice [`Allocator::allocate`] returns, which is
     /// trivially zeroed.
@@ -818,17 +818,17 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 }
 
 // SAFETY: [`StaticAllocator`] asks that nothing about the allocator's own
-// lifetime can invalidate memory it handed out. For [`KAlloc`]:
+// lifetime can invalidate memory it handed out. For [`NtAlloc`]:
 //
 // - it has no `Drop` impl, so dropping one releases nothing;
 // - it is a zero-sized type holding no state;
 // - its lifetime expiring frees nothing, because it owns nothing;
 // - nothing reachable from safe code can invalidate an allocation. The safe
-//   public surface is [`KAlloc::POOL_ZEROES`], [`KAlloc::kernel_alignment`],
-//   [`KAlloc::kernel_allocate`], [`KAlloc::allocate`] and
-//   [`KAlloc::allocate_aligned`], none of which free anything. Of the five
+//   public surface is [`NtAlloc::POOL_ZEROES`], [`NtAlloc::kernel_alignment`],
+//   [`NtAlloc::kernel_allocate`], [`NtAlloc::allocate`] and
+//   [`NtAlloc::allocate_aligned`], none of which free anything. Of the five
 //   functions that do return memory, two are `unsafe`
-//   ([`KAlloc::deallocate`] and [`KAlloc::deallocate_aligned`]) and the other
+//   ([`NtAlloc::deallocate`] and [`NtAlloc::deallocate_aligned`]) and the other
 //   three are private and called only from inside those two;
 // - all of the above hold for every equivalent allocator, since instances
 //   sharing the same const parameters are indistinguishable.
@@ -836,12 +836,12 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // A pool block therefore stays valid until the matching `ExFreePool` or
 // `ExFreePoolWithTag`, regardless of what happens to the allocator value.
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    StaticAllocator for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+    StaticAllocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
 }
 
 // SAFETY: [`AllocatorClone`] asks that a clone be interchangeable with the
-// original, so that either can free what the other allocated. [`KAlloc`] is a
+// original, so that either can free what the other allocated. [`NtAlloc`] is a
 // zero-sized type carrying no state: the pool, the tag and the free routine all
 // come from its const parameters, so two values of the same type forward to the
 // same pool calls identically. Moving or dropping one frees nothing, so blocks
@@ -849,7 +849,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // value and cannot unwind. The type is also `Copy`, which preserves that
 // equivalence exactly as cloning does.
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    AllocatorClone for KAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+    AllocatorClone for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
 }
 
@@ -1177,7 +1177,7 @@ mod tests {
     }
 
     /// Pins the one property that keeps the allocate/free stash decision
-    /// consistent: [`KAlloc::allocate_slice`] reports exactly `layout.size()`,
+    /// consistent: [`NtAlloc::allocate_slice`] reports exactly `layout.size()`,
     /// so `min == max` in the range [`Allocator::deallocate`] accepts and a
     /// caller has exactly one legal size to free with.
     ///
@@ -1187,7 +1187,7 @@ mod tests {
     /// fails the flip check below.
     ///
     /// This does *not* guard the `size + align` over-allocation; that is
-    /// checked by the `debug_assert!`s inside [`KAlloc::allocate_aligned`],
+    /// checked by the `debug_assert!`s inside [`NtAlloc::allocate_aligned`],
     /// which is the only place both values are in scope.
     #[test]
     fn free_path_decision_cannot_flip() {
@@ -1298,7 +1298,7 @@ mod tests {
     }
 
     /// Both zeroing entry points must honour their guarantee, whichever
-    /// branch of [`KAlloc::POOL_ZEROES`] is compiled in.
+    /// branch of [`NtAlloc::POOL_ZEROES`] is compiled in.
     #[test]
     fn zeroing_entry_points_honour_their_guarantee() {
         type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
@@ -1329,7 +1329,7 @@ mod tests {
         }
     }
 
-    /// Exercises the other branch of [`KAlloc::POOL_ZEROES`]. A configuration
+    /// Exercises the other branch of [`NtAlloc::POOL_ZEROES`]. A configuration
     /// carrying `POOL_FLAG_UNINITIALIZED` gets no zeroing from the pool, so
     /// the zeroing entry points have to do it themselves — this is the branch
     /// that keeps the override from becoming a soundness hole, and no other
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn an_uninitialized_pool_still_zeroes_where_it_promises_to() {
         type Uninit =
-            KAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
+            NtAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
         const {
             assert!(
                 !Uninit::POOL_ZEROES,
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     /// Covers the zero-size corner of both zeroing entry points, under both
-    /// values of [`KAlloc::POOL_ZEROES`].
+    /// values of [`NtAlloc::POOL_ZEROES`].
     ///
     /// The interesting cell is [`Allocator::allocate_zeroed`] with a zero-size
     /// layout on a pool that does not zero: the block it gets back is the
@@ -1399,7 +1399,7 @@ mod tests {
     fn zero_size_meets_the_zeroing_paths() {
         type Zeroing = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
         type NonZeroing =
-            KAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
+            NtAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }, DEFAULT_MEMORY_TAG, true>;
         const { assert!(Zeroing::POOL_ZEROES) };
         const { assert!(!NonZeroing::POOL_ZEROES) };
 
