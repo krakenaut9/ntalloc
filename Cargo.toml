@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
+
+[features]
+# Implements the StaticAllocator and AllocatorClone marker traits. Nightlies
+# that predate them fail to compile with this on, so it is opt-in.
+allocator-api-markers = []
+
+[package.metadata.docs.rs]
+all-features = true

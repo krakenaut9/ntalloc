@@ -48,6 +48,15 @@
 //! // SAFETY: `ptr` came from `Alloc::allocate` and needed no realignment.
 //! unsafe { Alloc::deallocate(ptr) };
 //! ```
+//!
+//! # Features
+//!
+//! - **`allocator-api-markers`** — implements the `StaticAllocator` and
+//!   `AllocatorClone` marker traits for [`NtAlloc`]. `alloc` requires them in
+//!   places: `Box::pin_in` needs `StaticAllocator`, and cloning an `Arc` or
+//!   `Rc`, or using a `BTreeMap` at all, needs `AllocatorClone`. Off by
+//!   default, because on a nightly that predates these traits, enabling it
+//!   fails to compile.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -62,8 +71,10 @@ mod bindings;
 
 use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_UNINITIALIZED, POOL_FLAGS};
 use alloc::alloc::{AllocError, Allocator};
+#[cfg(feature = "allocator-api-markers")]
+use core::alloc::{AllocatorClone, StaticAllocator};
 use core::{
-    alloc::{AllocatorClone, GlobalAlloc, Layout, StaticAllocator},
+    alloc::{GlobalAlloc, Layout},
     num::NonZeroUsize,
     ptr::{NonNull, null_mut, slice_from_raw_parts_mut, without_provenance_mut},
 };
@@ -835,6 +846,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 //
 // A pool block therefore stays valid until the matching `ExFreePool` or
 // `ExFreePoolWithTag`, regardless of what happens to the allocator value.
+#[cfg(feature = "allocator-api-markers")]
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     StaticAllocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
@@ -848,6 +860,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // stay valid while clones live, and the derived `Clone` copies a zero-sized
 // value and cannot unwind. The type is also `Copy`, which preserves that
 // equivalence exactly as cloning does.
+#[cfg(feature = "allocator-api-markers")]
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     AllocatorClone for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
@@ -1454,5 +1467,17 @@ mod tests {
                 NonZeroing::deallocate_aligned(non_zeroing_slice.as_ptr().cast::<u8>(), layout);
             }
         }
+    }
+
+    /// Both marker traits have empty bodies, so nothing else in the suite
+    /// notices if an impl is removed or gated wrongly. These bounds are
+    /// checked at compile time; the call sites exist only to instantiate them.
+    #[cfg(feature = "allocator-api-markers")]
+    #[test]
+    fn the_marker_traits_are_implemented() {
+        fn assert_markers<A: StaticAllocator + AllocatorClone>() {}
+
+        assert_markers::<PagedAlloc>();
+        assert_markers::<NonPagedAlloc>();
     }
 }
