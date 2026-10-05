@@ -69,7 +69,10 @@ extern crate alloc;
 
 mod bindings;
 
-use crate::bindings::{POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_UNINITIALIZED, POOL_FLAGS};
+use crate::bindings::{
+    POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_RAISE_ON_FAILURE, POOL_FLAG_UNINITIALIZED,
+    POOL_FLAGS,
+};
 use alloc::alloc::{AllocError, Allocator};
 #[cfg(feature = "allocator-api-markers")]
 use core::alloc::{AllocatorClone, StaticAllocator};
@@ -104,6 +107,7 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// # Type Parameters
 /// - `ALLOC_POOL_FLAGS`: the pool flags passed to `ExAllocatePool2`,
 ///   selecting which pool (e.g. paged or non-paged) allocations come from.
+///   `POOL_FLAG_RAISE_ON_FAILURE` is refused; see [below](#unsupported-flags).
 /// - `MEMORY_TAG`: the 4-byte pool tag attached to every allocation, used by
 ///   tools such as `!poolused`/`!poolfind` to attribute pool memory back to
 ///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`].
@@ -114,6 +118,29 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 ///
 /// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `NtAlloc`
 /// directly.
+///
+/// # Unsupported flags
+///
+/// `POOL_FLAG_RAISE_ON_FAILURE` (`0x20`) makes `ExAllocatePool2` raise an SEH
+/// exception on failure instead of returning null. Rust cannot catch SEH: left
+/// unhandled the exception bugchecks the system, and handled further up it
+/// unwinds through Rust frames, which is undefined behaviour. So a type that
+/// includes the flag fails to build as soon as anything allocates with it.
+/// The error comes from `cargo build`; `cargo check` does not evaluate it.
+///
+/// Failure is reported as null instead. Fallible APIs such as
+/// `Box::try_new_in` return it as an error, and infallible ones such as
+/// `Box::new` pass it to `handle_alloc_error`, which in a `#![no_std]` build
+/// panics by default: the fail-fast behaviour the flag would otherwise give.
+///
+/// ```compile_fail,E0080
+/// use ntalloc::NtAlloc;
+///
+/// // POOL_FLAG_NON_PAGED | POOL_FLAG_RAISE_ON_FAILURE
+/// type Raising = NtAlloc<{ 0x40 | 0x20 }>;
+///
+/// let _ = Raising::allocate(64);
+/// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NtAlloc<
     const ALLOC_POOL_FLAGS: POOL_FLAGS,
@@ -161,6 +188,26 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// default implementations would otherwise make over memory the pool has
     /// already zeroed.
     pub const POOL_ZEROES: bool = (ALLOC_POOL_FLAGS & POOL_FLAG_UNINITIALIZED) == 0;
+
+    /// Fails the build for a configuration whose `ALLOC_POOL_FLAGS` include
+    /// `POOL_FLAG_RAISE_ON_FAILURE`.
+    ///
+    /// With that flag `ExAllocatePool2` raises an SEH exception on failure
+    /// instead of returning null. Unhandled, the exception bugchecks the
+    /// system; handled further up, it unwinds through Rust frames that call
+    /// `ExAllocatePool2` through a non-unwinding ABI, which is undefined
+    /// behaviour. Either way the null that [`GlobalAlloc`] and [`Allocator`]
+    /// report failure with never arrives.
+    ///
+    /// Both allocation backends evaluate this before anything else, so the
+    /// error appears wherever such a type allocates. A constant that depends
+    /// on the type's parameters is only evaluated when code is generated for
+    /// it, which is why `cargo build` reports it and `cargo check` does not.
+    const FLAGS_SUPPORTED: () = assert!(
+        (ALLOC_POOL_FLAGS & POOL_FLAG_RAISE_ON_FAILURE) == 0,
+        "POOL_FLAG_RAISE_ON_FAILURE is not supported: ExAllocatePool2 would \
+         raise an SEH exception on failure, which Rust cannot catch"
+    );
 
     /// Returns the address, one pointer-width before `ptr`, where the
     /// original (pre-alignment) pointer is stored by
@@ -254,9 +301,15 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// zeroes, so without this the tests would exercise a backend that
     /// behaves differently from the shipped one on exactly the property
     /// [`GlobalAlloc::alloc_zeroed`] depends on.
+    ///
+    /// It refuses the same flags too, through [`NtAlloc::FLAGS_SUPPORTED`],
+    /// so a configuration the shipped path will not build cannot pass its
+    /// tests.
     #[cfg(test)]
     #[inline(always)]
     fn usermode_allocate(size: usize) -> *mut u8 {
+        let () = Self::FLAGS_SUPPORTED;
+
         if size == 0 {
             return null_mut();
         }
@@ -297,6 +350,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// ```
     #[inline(always)]
     pub fn kernel_allocate(size: usize) -> *mut u8 {
+        // Fails the build, not anything at runtime, for flags this crate
+        // cannot support; see FLAGS_SUPPORTED.
+        let () = Self::FLAGS_SUPPORTED;
+
         if size == 0 {
             return null_mut();
         }
