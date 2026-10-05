@@ -481,6 +481,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         if Self::is_kernel_aligned(layout) {
             Self::allocate(layout.size())
         } else {
+            // Cannot overflow: Layout guarantees size rounded up to align is
+            // at most isize::MAX, so size + align is at most isize::MAX + 1.
             let extended_buffer_size = layout.size() + layout.align();
             let buffer = Self::allocate(extended_buffer_size);
             if buffer.is_null() {
