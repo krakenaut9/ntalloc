@@ -107,10 +107,13 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// # Type Parameters
 /// - `ALLOC_POOL_FLAGS`: the pool flags passed to `ExAllocatePool2`,
 ///   selecting which pool (e.g. paged or non-paged) allocations come from.
-///   `POOL_FLAG_RAISE_ON_FAILURE` is refused; see [below](#unsupported-flags).
+///   `POOL_FLAG_RAISE_ON_FAILURE` is refused; see
+///   [below](#unsupported-configurations).
 /// - `MEMORY_TAG`: the 4-byte pool tag attached to every allocation, used by
 ///   tools such as `!poolused`/`!poolfind` to attribute pool memory back to
-///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`].
+///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`]. The WDK asks for one
+///   to four printable ASCII characters (`0x20` to `0x7E`); only a zero tag
+///   is refused.
 /// - `TAGGED_DEALLOC`: selects the free routine used by [`NtAlloc::deallocate`]:
 ///   `true` uses `ExFreePoolWithTag` (the tag must match the one the memory
 ///   was allocated with), `false` uses the untagged `ExFreePool`. Defaults to
@@ -119,19 +122,28 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `NtAlloc`
 /// directly.
 ///
-/// # Unsupported flags
+/// # Unsupported configurations
 ///
-/// `POOL_FLAG_RAISE_ON_FAILURE` (`0x20`) makes `ExAllocatePool2` raise an SEH
-/// exception on failure instead of returning null. Rust cannot catch SEH: left
-/// unhandled the exception bugchecks the system, and handled further up it
-/// unwinds through Rust frames, which is undefined behaviour. So a type that
-/// includes the flag fails to build as soon as anything allocates with it.
-/// The error comes from `cargo build`; `cargo check` does not evaluate it.
+/// These configurations would either fail every allocation or fail in a way
+/// Rust cannot handle, so a type that uses one fails to build as soon as
+/// anything allocates with it. The error comes from `cargo build`;
+/// `cargo check` does not evaluate it.
 ///
-/// Failure is reported as null instead. Fallible APIs such as
-/// `Box::try_new_in` return it as an error, and infallible ones such as
-/// `Box::new` pass it to `handle_alloc_error`, which in a `#![no_std]` build
-/// panics by default: the fail-fast behaviour the flag would otherwise give.
+/// - `POOL_FLAG_RAISE_ON_FAILURE` (`0x20`) makes `ExAllocatePool2` raise an
+///   SEH exception on failure instead of returning null. Rust cannot catch
+///   SEH: left unhandled the exception bugchecks the system, and handled
+///   further up it unwinds through Rust frames, which is undefined behaviour.
+/// - A zero `MEMORY_TAG`, which `ExAllocatePool2` rejects as invalid.
+///
+/// Without `POOL_FLAG_RAISE_ON_FAILURE`, failure is reported as null.
+/// Fallible APIs such as `Box::try_new_in` return it as an error, and
+/// infallible ones such as `Box::new` pass it to `handle_alloc_error`, which
+/// in a `#![no_std]` build panics by default: the fail-fast behaviour the flag
+/// would otherwise give.
+///
+/// This is not a full validation of the parameters: any other combination
+/// the pool considers invalid fails at run time, like any other allocation
+/// failure.
 ///
 /// ```compile_fail,E0080
 /// use ntalloc::NtAlloc;
@@ -140,6 +152,15 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// type Raising = NtAlloc<{ 0x40 | 0x20 }>;
 ///
 /// let _ = Raising::allocate(64);
+/// ```
+///
+/// ```compile_fail,E0080
+/// use ntalloc::NtAlloc;
+///
+/// // POOL_FLAG_NON_PAGED with a zero tag
+/// type Untagged = NtAlloc<0x40, 0>;
+///
+/// let _ = Untagged::allocate(64);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NtAlloc<
@@ -189,25 +210,34 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// already zeroed.
     pub const POOL_ZEROES: bool = (ALLOC_POOL_FLAGS & POOL_FLAG_UNINITIALIZED) == 0;
 
-    /// Fails the build for a configuration whose `ALLOC_POOL_FLAGS` include
-    /// `POOL_FLAG_RAISE_ON_FAILURE`.
+    /// Fails the build for a configuration [`NtAlloc`] refuses: one whose
+    /// `ALLOC_POOL_FLAGS` include `POOL_FLAG_RAISE_ON_FAILURE`, or whose
+    /// `MEMORY_TAG` is zero.
     ///
-    /// With that flag `ExAllocatePool2` raises an SEH exception on failure
-    /// instead of returning null. Unhandled, the exception bugchecks the
-    /// system; handled further up, it unwinds through Rust frames that call
-    /// `ExAllocatePool2` through a non-unwinding ABI, which is undefined
-    /// behaviour. Either way the null that [`GlobalAlloc`] and [`Allocator`]
-    /// report failure with never arrives.
+    /// With `POOL_FLAG_RAISE_ON_FAILURE`, `ExAllocatePool2` raises an SEH
+    /// exception on failure instead of returning null. Unhandled, the
+    /// exception bugchecks the system; handled further up, it unwinds through
+    /// Rust frames that call `ExAllocatePool2` through a non-unwinding ABI,
+    /// which is undefined behaviour. Either way the null that [`GlobalAlloc`]
+    /// and [`Allocator`] report failure with never arrives. A zero tag fails
+    /// every allocation, since `ExAllocatePool2` rejects it as invalid.
     ///
     /// Both allocation backends evaluate this before anything else, so the
     /// error appears wherever such a type allocates. A constant that depends
     /// on the type's parameters is only evaluated when code is generated for
     /// it, which is why `cargo build` reports it and `cargo check` does not.
-    const FLAGS_SUPPORTED: () = assert!(
-        (ALLOC_POOL_FLAGS & POOL_FLAG_RAISE_ON_FAILURE) == 0,
-        "POOL_FLAG_RAISE_ON_FAILURE is not supported: ExAllocatePool2 would \
-         raise an SEH exception on failure, which Rust cannot catch"
-    );
+    const CONFIGURATION_SUPPORTED: () = {
+        assert!(
+            (ALLOC_POOL_FLAGS & POOL_FLAG_RAISE_ON_FAILURE) == 0,
+            "POOL_FLAG_RAISE_ON_FAILURE is not supported: ExAllocatePool2 would \
+             raise an SEH exception on failure, which Rust cannot catch"
+        );
+        assert!(
+            MEMORY_TAG != 0,
+            "MEMORY_TAG is zero: ExAllocatePool2 fails every allocation with a \
+             zero tag"
+        );
+    };
 
     /// Returns the address, one pointer-width before `ptr`, where the
     /// original (pre-alignment) pointer is stored by
@@ -302,13 +332,13 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// behaves differently from the shipped one on exactly the property
     /// [`GlobalAlloc::alloc_zeroed`] depends on.
     ///
-    /// It refuses the same flags too, through [`NtAlloc::FLAGS_SUPPORTED`],
-    /// so a configuration the shipped path will not build cannot pass its
-    /// tests.
+    /// It refuses the same configurations too, through
+    /// [`NtAlloc::CONFIGURATION_SUPPORTED`], so a configuration the shipped
+    /// path will not build cannot pass its tests.
     #[cfg(test)]
     #[inline(always)]
     fn usermode_allocate(size: usize) -> *mut u8 {
-        let () = Self::FLAGS_SUPPORTED;
+        let () = Self::CONFIGURATION_SUPPORTED;
 
         if size == 0 {
             return null_mut();
@@ -350,9 +380,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// ```
     #[inline(always)]
     pub fn kernel_allocate(size: usize) -> *mut u8 {
-        // Fails the build, not anything at runtime, for flags this crate
-        // cannot support; see FLAGS_SUPPORTED.
-        let () = Self::FLAGS_SUPPORTED;
+        // Fails the build, not anything at runtime, for a configuration this
+        // crate refuses; see CONFIGURATION_SUPPORTED.
+        let () = Self::CONFIGURATION_SUPPORTED;
 
         if size == 0 {
             return null_mut();
