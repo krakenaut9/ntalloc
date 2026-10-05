@@ -869,7 +869,6 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     #[test]
     fn require_realignment_test() {
@@ -899,30 +898,37 @@ mod tests {
 
     #[test]
     fn original_pointer_location_test() {
-        let ptr = 0x1000 as *mut u8;
+        // Stepping back a slot has to stay inside one allocation, so this
+        // needs real memory rather than a bare address.
+        let mut slots = [null_mut::<u8>(); 2];
+        let base = slots.as_mut_ptr();
+        // SAFETY: `slots` has two elements, so one past the first is in bounds.
+        let ptr = unsafe { base.add(1) }.cast::<u8>();
         let original_ptr_location =
             PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer_location(ptr);
-        assert_eq!(
-            original_ptr_location,
-            (ptr as usize - POINTER_SIZE) as *mut *mut u8
-        );
+        assert_eq!(original_ptr_location, base);
     }
 
     #[test]
     fn save_original_pointer_test() {
-        let mut buffer: Vec<u8> = Vec::with_capacity(16);
-        let aligned_ptr = unsafe { buffer.as_mut_ptr().byte_add(POINTER_SIZE) }; // simulate aligned pointer
-        let original_ptr = 0x1000 as *mut u8;
+        // The slot is written as a whole pointer, so it must be pointer
+        // aligned, as it always is in real use: the realigned pointer is
+        // aligned to more than MIN_ALIGNMENT and the slot sits one pointer
+        // before it. A byte buffer would only be 1-byte aligned.
+        let mut slots = [null_mut::<u8>(); 2];
+        // SAFETY: `slots` has two elements, so one past the first is in bounds.
+        let aligned_ptr = unsafe { slots.as_mut_ptr().add(1) }.cast::<u8>();
+        let original_ptr = without_provenance_mut::<u8>(0x1000);
         PagedAlloc::<DEFAULT_MEMORY_TAG, true>::save_original_pointer(aligned_ptr, original_ptr);
-        let original_ptr_location =
-            PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer_location(aligned_ptr);
-        let saved_original_ptr = unsafe { *original_ptr_location };
-        assert_eq!(saved_original_ptr, original_ptr);
+        assert_eq!(
+            PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer(aligned_ptr),
+            original_ptr
+        );
     }
 
     #[test]
     fn align_up_to_test_less_than_min_alignment() {
-        let ptr = 0x1003 as *mut u8;
+        let ptr = without_provenance_mut::<u8>(0x1003);
         let alignment = 4;
         let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
             ptr,
@@ -934,7 +940,7 @@ mod tests {
 
     #[test]
     fn align_up_to_test_greater_than_min_alignment() {
-        let ptr = 0x1003 as *mut u8;
+        let ptr = without_provenance_mut::<u8>(0x1003);
         let alignment = 64;
         let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
             ptr,
@@ -946,7 +952,7 @@ mod tests {
 
     #[test]
     fn align_up_to_test_page_size_alignment() {
-        let ptr = 0x1003 as *mut u8;
+        let ptr = without_provenance_mut::<u8>(0x1003);
         let alignment = PAGE_SIZE as usize;
         let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
             ptr,
@@ -958,7 +964,7 @@ mod tests {
 
     #[test]
     fn align_up_to_test_greater_than_page_size_alignment() {
-        let ptr = 0x1003 as *mut u8;
+        let ptr = without_provenance_mut::<u8>(0x1003);
         let alignment = PAGE_SIZE as usize * 2;
         let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
             ptr,
@@ -1055,7 +1061,7 @@ mod tests {
         for alignment in [MIN_ALIGNMENT, 64, PAGE_SIZE as usize] {
             let base = alignment * 4;
             let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
-                base as *mut u8,
+                without_provenance_mut::<u8>(base),
                 NonZeroUsize::new(alignment).unwrap(),
             ) as usize;
 
@@ -1077,7 +1083,7 @@ mod tests {
             for step in 0..(alignment / MIN_ALIGNMENT) {
                 let base = 0x10_0000 + step * MIN_ALIGNMENT;
                 let aligned = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::align_up_to(
-                    base as *mut u8,
+                    without_provenance_mut::<u8>(base),
                     NonZeroUsize::new(alignment).unwrap(),
                 ) as usize;
                 let gap = aligned - base;
