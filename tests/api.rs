@@ -110,6 +110,42 @@ fn an_impossible_size_is_null_not_a_panic() {
     }
 }
 
+/// The exported pool flags compose into configurations a consumer can name,
+/// and `POOL_FLAG_UNINITIALIZED` hands zeroing over to the zeroing entry points.
+#[test]
+fn exported_pool_flags_compose_into_working_allocators() {
+    use ntalloc::{
+        NtAlloc, POOL_FLAG_CACHE_ALIGNED, POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED,
+        POOL_FLAG_SPECIAL_POOL, POOL_FLAG_UNINITIALIZED, POOL_FLAG_USE_QUOTA, POOL_FLAGS,
+    };
+
+    const SCRATCH: POOL_FLAGS = POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED;
+    type Scratch = NtAlloc<SCRATCH>;
+    const SPECIAL: POOL_FLAGS =
+        POOL_FLAG_PAGED | POOL_FLAG_CACHE_ALIGNED | POOL_FLAG_USE_QUOTA | POOL_FLAG_SPECIAL_POOL;
+    type Special = NtAlloc<SPECIAL>;
+
+    const { assert!(!Scratch::POOL_ZEROES) };
+    const { assert!(Special::POOL_ZEROES) };
+
+    // The pool leaves this memory uninitialized, so `alloc_zeroed` must zero
+    // it itself; under Miri, reading bytes it skipped is an error.
+    let layout = Layout::from_size_align(256, 64).unwrap();
+    // SAFETY: a non-zero layout, freed below with the same layout.
+    let ptr = unsafe { Scratch::default().alloc_zeroed(layout) };
+    assert!(!ptr.is_null());
+    // SAFETY: `ptr` holds `layout.size()` bytes that `alloc_zeroed` initialized.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
+    assert!(bytes.iter().all(|&b| b == 0));
+    // SAFETY: from `alloc_zeroed` with this layout, freed once.
+    unsafe { Scratch::default().dealloc(ptr, layout) };
+
+    let ptr = Special::allocate(64);
+    assert!(!ptr.is_null());
+    // SAFETY: from `Special::allocate`, never realigned, freed once.
+    unsafe { Special::deallocate(ptr) };
+}
+
 /// Runs `test` from this binary in a child process with `trigger` set, for
 /// misuse that ends the process, and returns what the child wrote to stderr.
 ///

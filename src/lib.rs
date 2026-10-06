@@ -10,7 +10,9 @@
 //!
 //! - [`NtAlloc`] is a zero-sized allocator type parameterized over the pool
 //!   flags, the memory tag, and whether deallocation uses the tagged or
-//!   untagged free routine.
+//!   untagged free routine. The pool flags are exported as `POOL_FLAG_*`
+//!   constants, such as [`POOL_FLAG_NON_PAGED`] and
+//!   [`POOL_FLAG_UNINITIALIZED`].
 //! - [`PagedAlloc`] and [`NonPagedAlloc`] are convenience aliases for the
 //!   paged and non-paged pool, respectively.
 //! - Allocations are tagged with a 4-byte ASCII tag (see
@@ -91,9 +93,10 @@ mod bindings;
 #[cfg(any(test, feature = "usermode-backend"))]
 mod usermode;
 
-use crate::bindings::{
-    POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_RAISE_ON_FAILURE, POOL_FLAG_UNINITIALIZED,
-    POOL_FLAGS,
+use crate::bindings::POOL_FLAG_RAISE_ON_FAILURE;
+pub use crate::bindings::{
+    POOL_FLAG_CACHE_ALIGNED, POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_SPECIAL_POOL,
+    POOL_FLAG_UNINITIALIZED, POOL_FLAG_USE_QUOTA, POOL_FLAGS,
 };
 use alloc::alloc::{AllocError, Allocator};
 #[cfg(feature = "allocator-api-markers")]
@@ -127,10 +130,13 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// with [`Default::default()`] at zero runtime cost.
 ///
 /// # Type Parameters
-/// - `ALLOC_POOL_FLAGS`: the pool flags passed to `ExAllocatePool2`,
-///   selecting which pool (e.g. paged or non-paged) allocations come from.
-///   `POOL_FLAG_RAISE_ON_FAILURE` is refused; see
-///   [below](#unsupported-configurations).
+/// - `ALLOC_POOL_FLAGS`: the pool flags passed to `ExAllocatePool2`.
+///   [`POOL_FLAG_PAGED`] or [`POOL_FLAG_NON_PAGED`] selects the pool, and
+///   [`POOL_FLAG_UNINITIALIZED`], [`POOL_FLAG_CACHE_ALIGNED`],
+///   [`POOL_FLAG_USE_QUOTA`] or [`POOL_FLAG_SPECIAL_POOL`] can be added to
+///   it, as in the example below. Flags from `wdm.h` that this crate does not
+///   export can be passed as raw values. `POOL_FLAG_RAISE_ON_FAILURE` is
+///   refused; see [below](#unsupported-configurations).
 /// - `MEMORY_TAG`: the 4-byte pool tag attached to every allocation, used by
 ///   tools such as `!poolused`/`!poolfind` to attribute pool memory back to
 ///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`]. The WDK asks for one
@@ -142,7 +148,16 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 ///   `true`.
 ///
 /// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `NtAlloc`
-/// directly.
+/// directly, unless the configuration needs more flags than the pool:
+///
+/// ```
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED, POOL_FLAG_UNINITIALIZED};
+///
+/// // Non-paged pool that skips the zeroing ExAllocatePool2 otherwise does.
+/// type ScratchAlloc = NtAlloc<{ POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED }>;
+///
+/// assert!(!ScratchAlloc::POOL_ZEROES);
+/// ```
 ///
 /// # Unsupported configurations
 ///
@@ -168,19 +183,18 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// failure.
 ///
 /// ```compile_fail,E0080
-/// use ntalloc::NtAlloc;
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
 ///
-/// // POOL_FLAG_NON_PAGED | POOL_FLAG_RAISE_ON_FAILURE
-/// type Raising = NtAlloc<{ 0x40 | 0x20 }>;
+/// // 0x20 is POOL_FLAG_RAISE_ON_FAILURE, which this crate does not export.
+/// type Raising = NtAlloc<{ POOL_FLAG_NON_PAGED | 0x20 }>;
 ///
 /// let _ = Raising::allocate(64);
 /// ```
 ///
 /// ```compile_fail,E0080
-/// use ntalloc::NtAlloc;
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
 ///
-/// // POOL_FLAG_NON_PAGED with a zero tag
-/// type Untagged = NtAlloc<0x40, 0>;
+/// type Untagged = NtAlloc<POOL_FLAG_NON_PAGED, 0>;
 ///
 /// let _ = Untagged::allocate(64);
 /// ```
@@ -191,7 +205,7 @@ pub struct NtAlloc<
     const TAGGED_DEALLOC: bool = true,
 >;
 
-/// [`NtAlloc`] backed by the paged pool (`POOL_FLAG_PAGED`).
+/// [`NtAlloc`] backed by the paged pool ([`POOL_FLAG_PAGED`]).
 ///
 /// Memory from the paged pool may be paged out to disk, so it may only be
 /// touched at IRQL `APC_LEVEL` or below — that is, strictly below
@@ -199,7 +213,7 @@ pub struct NtAlloc<
 /// holding a spin lock.
 pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEALLOC: bool = true> =
     NtAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
-/// [`NtAlloc`] backed by the non-paged pool (`POOL_FLAG_NON_PAGED`).
+/// [`NtAlloc`] backed by the non-paged pool ([`POOL_FLAG_NON_PAGED`]).
 ///
 /// Non-paged pool memory is always resident and safe to access at any IRQL,
 /// at the cost of being a more constrained system-wide resource than paged
@@ -222,7 +236,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Whether allocations from this configuration arrive zero-initialized.
     ///
     /// `ExAllocatePool2` zeroes every block it returns unless
-    /// `POOL_FLAG_UNINITIALIZED` is among `ALLOC_POOL_FLAGS`, so this is a
+    /// [`POOL_FLAG_UNINITIALIZED`] is among `ALLOC_POOL_FLAGS`, so this is a
     /// property of the type, resolved at compile time. It is `true` for
     /// [`PagedAlloc`] and [`NonPagedAlloc`].
     ///
