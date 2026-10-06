@@ -67,11 +67,12 @@
 //!   out, and, with `TAGGED_DEALLOC`, on the wrong tag. On Windows any abort
 //!   is reported as `STATUS_STACK_BUFFER_OVERRUN`, whatever its cause, and
 //!   running the tests with `-- --test-threads=1` shows which test it was.
-//!   It brings in `std`, so enable it only under `[dev-dependencies]`:
-//!   through a normal dependency it reaches the driver itself, which then
-//!   fails to build with a duplicate `panic_impl` lang item, as `std`'s panic
-//!   handler clashes with the driver's own. [`NtAlloc::kernel_allocate`]
-//!   always uses the pool, with or without it.
+//!   It brings in `std`, along with the `hashbrown` and `allocator-api2`
+//!   crates, so enable it only under `[dev-dependencies]`: through a normal
+//!   dependency it reaches the driver itself, which then fails to build with
+//!   a duplicate `panic_impl` lang item, as `std`'s panic handler clashes with
+//!   the driver's own. [`NtAlloc::kernel_allocate`] always uses the pool,
+//!   with or without it.
 //!
 //!   ```toml
 //!   [dev-dependencies]

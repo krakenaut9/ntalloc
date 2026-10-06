@@ -18,10 +18,13 @@ struct UsermodeBlock {
 }
 
 /// The map behind [`USERMODE_BLOCKS`], from block address to record, with its
-/// memory from `System`. It hashes with `DefaultHasher` under fixed keys
-/// rather than random ones: random keys protect against input chosen to
-/// collide, and the input here is addresses the heap picked.
-type UsermodeBlockTable = std::collections::HashMap<
+/// memory from `System`. It is `hashbrown`'s map, the one std's `HashMap` is
+/// built on, because std's own takes an allocator only on nightly; `System`
+/// qualifies as one through the `std` feature of `allocator-api2`, whose
+/// `Allocator` trait `hashbrown` takes. It hashes with `DefaultHasher` under
+/// fixed keys rather than random ones: random keys protect against input
+/// chosen to collide, and the input here is addresses the heap picked.
+type UsermodeBlockTable = hashbrown::HashMap<
     usize,
     UsermodeBlock,
     std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
@@ -38,27 +41,25 @@ type UsermodeBlockTable = std::collections::HashMap<
 ///
 /// It is a hash map, so recording or finding a block takes constant time on
 /// average, however many are live. Its own storage comes from `System`
-/// directly, never from the global allocator, which may be this crate.
-/// `HashMap` has no `const` constructor that takes an allocator, so
-/// [`with_usermode_blocks`] creates the map on first use.
+/// directly, never from the global allocator, which may be this crate. It
+/// starts empty, which allocates nothing.
 ///
 /// A size header just before each block would be simpler, but freeing would
 /// then read memory outside the block through the caller's pointer. Rust's
 /// aliasing rules forbid that once the caller has narrowed the pointer to the
 /// block, as the standard library does through `Box`.
-static USERMODE_BLOCKS: std::sync::Mutex<Option<UsermodeBlockTable>> = std::sync::Mutex::new(None);
+static USERMODE_BLOCKS: std::sync::Mutex<UsermodeBlockTable> = std::sync::Mutex::new(
+    UsermodeBlockTable::with_hasher_in(std::hash::BuildHasherDefault::new(), std::alloc::System),
+);
 
-/// Runs `f` on the table of live blocks while holding its lock, creating the
-/// table on first use. The table allocates only from `System`, so working on
-/// it never calls back into this crate's allocator, which would try to take
-/// the lock it already holds.
+/// Runs `f` on the table of live blocks while holding its lock. The table
+/// allocates only from `System`, so working on it never calls back into this
+/// crate's allocator, which would try to take the lock it already holds.
 fn with_usermode_blocks<R>(f: impl FnOnce(&mut UsermodeBlockTable) -> R) -> R {
     let mut table = USERMODE_BLOCKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(table.get_or_insert_with(|| {
-        UsermodeBlockTable::with_hasher_in(std::hash::BuildHasherDefault::new(), std::alloc::System)
-    }))
+    f(&mut table)
 }
 
 /// Reports a misuse of the process-heap backend, then aborts the process.

@@ -5,6 +5,12 @@ edition = "2024"
 
 [dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
+# The heap backend's table of live blocks: hashbrown's map, on memory from
+# std's System allocator through allocator-api2, since std's own HashMap
+# takes an allocator only on nightly. allocator-api2 must stay on the release
+# line hashbrown uses (0.2), or System's impl lands on a different trait.
+allocator-api2 = { version = "0.2.21", optional = true, default-features = false, features = ["std"] }
+hashbrown = { version = "0.17", optional = true, default-features = false, features = ["allocator-api2"] }
 
 [features]
 # Implements the StaticAllocator and AllocatorClone marker traits. Nightlies
@@ -13,12 +19,16 @@ allocator-api-markers = []
 # For tests only: allocates from the process heap instead of the kernel pool,
 # so code using NtAlloc can run on a normal machine. Enable it only under
 # [dev-dependencies].
-usermode-backend = []
+usermode-backend = ["dep:allocator-api2", "dep:hashbrown"]
 
 [dev-dependencies]
 # Turns usermode-backend on for this crate's own tests. Packaging strips this,
 # so the files in tests/ gate themselves on the feature.
 ntalloc = { path = ".", features = ["usermode-backend"] }
+# The unit tests run on the heap backend even without the feature, as they do
+# in the packaged crate, where the line above is gone.
+allocator-api2 = { version = "0.2.21", default-features = false, features = ["std"] }
+hashbrown = { version = "0.17", default-features = false, features = ["allocator-api2"] }
 
 # Runs without the standard test harness; tests/global_allocator.rs says why.
 [[test]]
