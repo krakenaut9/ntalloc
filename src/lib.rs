@@ -1,10 +1,13 @@
 //! Windows kernel-mode pool allocator for `#![no_std]` Rust drivers.
 //!
 //! `ntalloc` wraps the WDK pool APIs (`ExAllocatePool2`, `ExFreePool`,
-//! `ExFreePoolWithTag`) behind the standard [`GlobalAlloc`] trait and the
-//! unstable [`Allocator`] trait, so ordinary `alloc`-crate types (`Vec`,
-//! `Box`, ...) can be backed by kernel pool memory from a `#![no_std]`
-//! driver.
+//! `ExFreePoolWithTag`) behind the standard [`GlobalAlloc`] trait and, with
+//! the `allocator-api` feature, the unstable [`Allocator`] trait, so ordinary
+//! `alloc`-crate types (`Vec`, `Box`, ...) can be backed by kernel pool
+//! memory from a `#![no_std]` driver. It builds on stable Rust 1.85 or
+//! newer; only `allocator-api` and `allocator-api-markers` need nightly.
+//!
+//! [`Allocator`]: core::alloc::Allocator
 //!
 //! # Overview
 //!
@@ -53,12 +56,16 @@
 //!
 //! # Features
 //!
+//! - **`allocator-api`** — implements the unstable `Allocator` trait for
+//!   [`NtAlloc`], so a collection can use it directly, as in `Vec::new_in`
+//!   and `Box::new_in`, not only as the `#[global_allocator]`. It needs a
+//!   nightly compiler, as does any code that uses the trait.
 //! - **`allocator-api-markers`** — implements the `StaticAllocator` and
 //!   `AllocatorClone` marker traits for [`NtAlloc`]. `alloc` requires them in
 //!   places: `Box::pin_in` needs `StaticAllocator`, and cloning an `Arc` or
-//!   `Rc`, or using a `BTreeMap` at all, needs `AllocatorClone`. Off by
-//!   default, because on a nightly that predates these traits, enabling it
-//!   fails to compile.
+//!   `Rc`, or using a `BTreeMap` at all, needs `AllocatorClone`. It implies
+//!   `allocator-api`. Off by default, because on a nightly that predates
+//!   these traits, enabling it fails to compile.
 //! - **`usermode-backend`** — for tests only. Allocates from the process heap
 //!   (`std::alloc::System`) instead of the kernel pool, so code that allocates
 //!   through [`NtAlloc`] can run in tests on a normal machine. Where the pool
@@ -80,13 +87,12 @@
 //!   ```
 
 #![no_std]
-#![feature(allocator_api)]
+#![cfg_attr(feature = "allocator-api", feature(allocator_api))]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
 
-extern crate alloc;
 #[cfg(any(test, feature = "usermode-backend"))]
 extern crate std;
 
@@ -99,13 +105,16 @@ pub use crate::bindings::{
     POOL_FLAG_CACHE_ALIGNED, POOL_FLAG_NON_PAGED, POOL_FLAG_PAGED, POOL_FLAG_SPECIAL_POOL,
     POOL_FLAG_UNINITIALIZED, POOL_FLAG_USE_QUOTA, POOL_FLAGS,
 };
-use alloc::alloc::{AllocError, Allocator};
+#[cfg(feature = "allocator-api")]
+use core::alloc::{AllocError, Allocator};
 #[cfg(feature = "allocator-api-markers")]
 use core::alloc::{AllocatorClone, StaticAllocator};
+#[cfg(feature = "allocator-api")]
+use core::ptr::{NonNull, slice_from_raw_parts_mut, without_provenance_mut};
 use core::{
     alloc::{GlobalAlloc, Layout},
     num::NonZeroUsize,
-    ptr::{NonNull, null_mut, slice_from_raw_parts_mut, without_provenance_mut},
+    ptr::null_mut,
 };
 use windows_sys::Wdk::System::SystemServices::{
     ExAllocatePool2, ExFreePool, ExFreePoolWithTag, PAGE_SIZE,
@@ -127,8 +136,11 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// compile time via its const generic parameters, and every operation is
 /// exposed as an associated function, so no instance ever needs to be
 /// constructed to use them directly. An instance is still needed to satisfy
-/// the [`GlobalAlloc`]/[`Allocator`] trait bounds, and can always be created
-/// with [`Default::default()`] at zero runtime cost.
+/// the [`GlobalAlloc`] trait bound (and, with the `allocator-api` feature,
+/// the [`Allocator`] one), and can always be created with
+/// [`Default::default()`] at zero runtime cost.
+///
+/// [`Allocator`]: core::alloc::Allocator
 ///
 /// # Type Parameters
 /// - `ALLOC_POOL_FLAGS`: the pool flags passed to `ExAllocatePool2`.
@@ -241,10 +253,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// property of the type, resolved at compile time. It is `true` for
     /// [`PagedAlloc`] and [`NonPagedAlloc`].
     ///
-    /// The [`GlobalAlloc::alloc_zeroed`] and [`Allocator::allocate_zeroed`]
-    /// implementations consult it to skip the redundant second pass their
-    /// default implementations would otherwise make over memory the pool has
-    /// already zeroed.
+    /// [`GlobalAlloc::alloc_zeroed`], and with the `allocator-api` feature
+    /// [`Allocator::allocate_zeroed`], consult it to skip the redundant second
+    /// pass their default implementations would otherwise make over memory the
+    /// pool has already zeroed.
+    ///
+    /// [`Allocator::allocate_zeroed`]: core::alloc::Allocator::allocate_zeroed
     pub const POOL_ZEROES: bool = (ALLOC_POOL_FLAGS & POOL_FLAG_UNINITIALIZED) == 0;
 
     /// Fails the build for a configuration [`NtAlloc`] refuses: one whose
@@ -258,6 +272,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// which is undefined behaviour. Either way the null that [`GlobalAlloc`]
     /// and [`Allocator`] report failure with never arrives. A zero tag fails
     /// every allocation, since `ExAllocatePool2` rejects it as invalid.
+    ///
+    /// [`Allocator`]: core::alloc::Allocator
     ///
     /// Both allocation backends evaluate this before anything else, so the
     /// error appears wherever such a type allocates. A constant that depends
@@ -448,6 +464,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// [`Allocator::deallocate`] accepts any size that *fits* rather than the
     /// exact one. Two separate properties currently guarantee it; both are
     /// checked by `free_path_decision_cannot_flip`.
+    ///
+    /// [`Allocator::deallocate`]: core::alloc::Allocator::deallocate
     #[inline(always)]
     fn is_kernel_aligned(layout: Layout) -> bool {
         let pool_alignment = Self::kernel_alignment(layout.size());
@@ -532,8 +550,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// behaviour but invites implementations to "guarantee a sentinel address
     /// or a null pointer in response to a zero-size allocation request" —
     /// this is that guarantee. Callers needing a usable pointer for an empty
-    /// allocation want the [`Allocator`] impl, which returns a dangling one
-    /// as that trait requires.
+    /// allocation want the [`Allocator`] impl (the `allocator-api` feature),
+    /// which returns a dangling one as that trait requires.
     ///
     /// # Note
     /// A pointer returned from this function when realignment was required
@@ -545,6 +563,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// [`NtAlloc::deallocate`] is fine either way — but since only `layout`
     /// distinguishes the two cases, always pairing with
     /// [`NtAlloc::deallocate_aligned`] is the rule that cannot go wrong.)
+    ///
+    /// [`Allocator`]: core::alloc::Allocator
     ///
     /// # Examples
     /// ```no_run
@@ -608,6 +628,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///   than [`MIN_ALIGNMENT`], since [`NtAlloc::allocate`] short-circuits a
     ///   zero-size request to a null pointer. The [`Allocator::allocate`]
     ///   implementation documents that case in full.
+    #[cfg(feature = "allocator-api")]
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
             // Allocator, unlike GlobalAlloc, requires zero-sized allocations
@@ -844,6 +865,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     }
 }
 
+#[cfg(feature = "allocator-api")]
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {

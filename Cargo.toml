@@ -2,6 +2,7 @@
 name = "ntalloc"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
@@ -13,9 +14,13 @@ allocator-api2 = { version = "0.2.21", optional = true, default-features = false
 hashbrown = { version = "0.17", optional = true, default-features = false, features = ["allocator-api2"] }
 
 [features]
+# Implements the unstable Allocator trait, so collections can use NtAlloc
+# directly (Vec::new_in, Box::new_in). Needs a nightly compiler; without it
+# the crate builds on stable.
+allocator-api = []
 # Implements the StaticAllocator and AllocatorClone marker traits. Nightlies
 # that predate them fail to compile with this on, so it is opt-in.
-allocator-api-markers = []
+allocator-api-markers = ["allocator-api"]
 # For tests only: allocates from the process heap instead of the kernel pool,
 # so code using NtAlloc can run on a normal machine. Enable it only under
 # [dev-dependencies].
@@ -36,4 +41,6 @@ name = "global_allocator"
 harness = false
 
 [package.metadata.docs.rs]
-all-features = true
+# The features that add API. usermode-backend adds none, and with it in the
+# build rustdoc would also list its dependencies' blanket impls on NtAlloc.
+features = ["allocator-api", "allocator-api-markers"]

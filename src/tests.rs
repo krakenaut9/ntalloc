@@ -1,4 +1,5 @@
 use super::*;
+use core::ptr::without_provenance_mut;
 
 #[test]
 fn require_realignment_test() {
@@ -247,6 +248,7 @@ fn zero_size_allocations_never_reach_the_pool() {
     }
 }
 
+#[cfg(feature = "allocator-api")]
 #[test]
 fn allocator_accepts_zero_sized_layouts() {
     // Allocator, unlike GlobalAlloc, requires these to succeed. Freeing
@@ -275,6 +277,7 @@ fn allocator_accepts_zero_sized_layouts() {
     }
 }
 
+#[cfg(feature = "allocator-api")]
 #[test]
 fn allocator_grow_from_zero_and_shrink_to_zero() {
     // The default grow/shrink implementations allocate, copy, then free the
@@ -302,6 +305,7 @@ fn allocator_grow_from_zero_and_shrink_to_zero() {
     unsafe { allocator.deallocate(shrunk.cast(), empty_layout) };
 }
 
+#[cfg(feature = "allocator-api")]
 #[test]
 fn allocator_zeroed_accepts_zero_sized_layouts() {
     let allocator = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::default();
@@ -337,6 +341,7 @@ fn kernel_allocate_guards_zero_without_reaching_the_pool() {
 /// This does *not* guard the `size + align` over-allocation; that is
 /// checked by the `debug_assert!`s inside [`NtAlloc::allocate_aligned`],
 /// which is the only place both values are in scope.
+#[cfg(feature = "allocator-api")]
 #[test]
 fn free_path_decision_cannot_flip() {
     type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
@@ -465,15 +470,18 @@ fn zeroing_entry_points_honour_their_guarantee() {
         unsafe { allocator.dealloc(ptr, layout) };
         assert_eq!(dirty, 0, "alloc_zeroed left {dirty} non-zero bytes");
 
-        // Allocator::allocate_zeroed
-        let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
-        assert_eq!(slice.len(), size);
-        let base = slice.as_ptr().cast::<u8>();
-        // SAFETY: `size` bytes from `base` are ours.
-        let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
-        // SAFETY: came from allocate_zeroed with this layout.
-        unsafe { allocator.deallocate(slice.cast(), layout) };
-        assert_eq!(dirty, 0, "allocate_zeroed left {dirty} non-zero bytes");
+        #[cfg(feature = "allocator-api")]
+        {
+            // Allocator::allocate_zeroed
+            let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
+            assert_eq!(slice.len(), size);
+            let base = slice.as_ptr().cast::<u8>();
+            // SAFETY: `size` bytes from `base` are ours.
+            let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
+            // SAFETY: came from allocate_zeroed with this layout.
+            unsafe { allocator.deallocate(slice.cast(), layout) };
+            assert_eq!(dirty, 0, "allocate_zeroed left {dirty} non-zero bytes");
+        }
     }
 }
 
@@ -515,22 +523,25 @@ fn an_uninitialized_pool_still_zeroes_where_it_promises_to() {
     unsafe { allocator.dealloc(ptr, layout) };
     assert_eq!(dirty, 0, "alloc_zeroed left {dirty} bytes unzeroed");
 
-    // Dirty again: allocate_zeroed must be shown to zero on its own, not
-    // to inherit a block the previous assertion already cleaned.
-    let dirtied = Uninit::allocate_aligned(layout);
-    assert!(!dirtied.is_null());
-    // SAFETY: `size` bytes from `dirtied` are ours.
-    unsafe { dirtied.write_bytes(0xCD, size) };
-    // SAFETY: `dirtied` came from allocate_aligned with this layout.
-    unsafe { Uninit::deallocate_aligned(dirtied, layout) };
+    #[cfg(feature = "allocator-api")]
+    {
+        // Dirty again: allocate_zeroed must be shown to zero on its own, not
+        // to inherit a block the previous assertion already cleaned.
+        let dirtied = Uninit::allocate_aligned(layout);
+        assert!(!dirtied.is_null());
+        // SAFETY: `size` bytes from `dirtied` are ours.
+        unsafe { dirtied.write_bytes(0xCD, size) };
+        // SAFETY: `dirtied` came from allocate_aligned with this layout.
+        unsafe { Uninit::deallocate_aligned(dirtied, layout) };
 
-    let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
-    let base = slice.as_ptr().cast::<u8>();
-    // SAFETY: `size` bytes from `base` are ours.
-    let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
-    // SAFETY: came from allocate_zeroed with this layout.
-    unsafe { allocator.deallocate(slice.cast(), layout) };
-    assert_eq!(dirty, 0, "allocate_zeroed left {dirty} bytes unzeroed");
+        let slice = allocator.allocate_zeroed(layout).expect("allocate_zeroed");
+        let base = slice.as_ptr().cast::<u8>();
+        // SAFETY: `size` bytes from `base` are ours.
+        let dirty = (0..size).filter(|i| unsafe { *base.add(*i) } != 0).count();
+        // SAFETY: came from allocate_zeroed with this layout.
+        unsafe { allocator.deallocate(slice.cast(), layout) };
+        assert_eq!(dirty, 0, "allocate_zeroed left {dirty} bytes unzeroed");
+    }
 }
 
 /// Covers the zero-size corner of both zeroing entry points, under both
@@ -571,35 +582,38 @@ fn zero_size_meets_the_zeroing_paths() {
             "align {align}: alloc_zeroed must be null without pool zeroing"
         );
 
-        // Allocator::allocate_zeroed -- succeeds with a dangling, aligned,
-        // length-0 slice on both, and the non-zeroing one writes 0 bytes
-        // through a no-provenance pointer on the way.
-        let zeroing_slice = Zeroing::default()
-            .allocate_zeroed(layout)
-            .expect("zero-size allocate_zeroed on a zeroing pool");
-        // This one writes 0 bytes through the no-provenance pointer.
-        let non_zeroing_slice = NonZeroing::default()
-            .allocate_zeroed(layout)
-            .expect("zero-size allocate_zeroed on a non-zeroing pool");
+        #[cfg(feature = "allocator-api")]
+        {
+            // Allocator::allocate_zeroed -- succeeds with a dangling, aligned,
+            // length-0 slice on both, and the non-zeroing one writes 0 bytes
+            // through a no-provenance pointer on the way.
+            let zeroing_slice = Zeroing::default()
+                .allocate_zeroed(layout)
+                .expect("zero-size allocate_zeroed on a zeroing pool");
+            // This one writes 0 bytes through the no-provenance pointer.
+            let non_zeroing_slice = NonZeroing::default()
+                .allocate_zeroed(layout)
+                .expect("zero-size allocate_zeroed on a non-zeroing pool");
 
-        for (label, slice) in [
-            ("zeroing", zeroing_slice),
-            ("non-zeroing", non_zeroing_slice),
-        ] {
-            assert_eq!(slice.len(), 0, "align {align} ({label}): length must be 0");
-            assert_eq!(
-                slice.as_ptr().cast::<u8>() as usize % align,
-                0,
-                "align {align} ({label}): pointer must still be aligned"
-            );
-        }
+            for (label, slice) in [
+                ("zeroing", zeroing_slice),
+                ("non-zeroing", non_zeroing_slice),
+            ] {
+                assert_eq!(slice.len(), 0, "align {align} ({label}): length must be 0");
+                assert_eq!(
+                    slice.as_ptr().cast::<u8>() as usize % align,
+                    0,
+                    "align {align} ({label}): pointer must still be aligned"
+                );
+            }
 
-        // Freeing is a no-op for a zero-size layout on any configuration,
-        // but each block goes back through the allocator that made it.
-        // SAFETY: both came from allocate_zeroed with this exact layout.
-        unsafe {
-            Zeroing::deallocate_aligned(zeroing_slice.as_ptr().cast::<u8>(), layout);
-            NonZeroing::deallocate_aligned(non_zeroing_slice.as_ptr().cast::<u8>(), layout);
+            // Freeing is a no-op for a zero-size layout on any configuration,
+            // but each block goes back through the allocator that made it.
+            // SAFETY: both came from allocate_zeroed with this exact layout.
+            unsafe {
+                Zeroing::deallocate_aligned(zeroing_slice.as_ptr().cast::<u8>(), layout);
+                NonZeroing::deallocate_aligned(non_zeroing_slice.as_ptr().cast::<u8>(), layout);
+            }
         }
     }
 }

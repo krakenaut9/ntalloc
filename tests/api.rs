@@ -4,11 +4,12 @@
 // Without the feature `NtAlloc` would call the real kernel pool, which a
 // test process cannot do.
 #![cfg(feature = "usermode-backend")]
-#![feature(allocator_api)]
+#![cfg_attr(feature = "allocator-api", feature(allocator_api))]
 #![cfg_attr(feature = "allocator-api-markers", feature(btreemap_alloc))]
 
 use core::alloc::{GlobalAlloc, Layout};
-use ntalloc::{DEFAULT_MEMORY_TAG, NonPagedAlloc, PagedAlloc};
+use ntalloc::{DEFAULT_MEMORY_TAG, PagedAlloc};
+#[cfg(feature = "allocator-api")]
 use std::alloc::Allocator;
 
 type Paged = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
@@ -76,8 +77,11 @@ fn realloc_keeps_contents_and_alignment() {
     }
 }
 
+#[cfg(feature = "allocator-api")]
 #[test]
 fn collections_work_through_the_allocator_api() {
+    use ntalloc::NonPagedAlloc;
+
     let mut v: Vec<u64, NonPagedAlloc> = Vec::new_in(NonPagedAlloc::default());
     v.extend(0..50_000);
     v.truncate(10);
@@ -106,6 +110,7 @@ fn an_impossible_size_is_null_not_a_panic() {
         let huge = Layout::from_size_align(isize::MAX as usize - 4095, 4096).unwrap();
         // SAFETY: a non-zero layout.
         assert!(unsafe { Paged::default().alloc(huge) }.is_null());
+        #[cfg(feature = "allocator-api")]
         assert!(Paged::default().allocate(huge).is_err());
     }
 }
