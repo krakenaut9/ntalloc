@@ -10,6 +10,20 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
 # Implements the StaticAllocator and AllocatorClone marker traits. Nightlies
 # that predate them fail to compile with this on, so it is opt-in.
 allocator-api-markers = []
+# For tests only: allocates from the process heap instead of the kernel pool,
+# so code using NtAlloc can run on a normal machine. Enable it only under
+# [dev-dependencies].
+usermode-backend = []
+
+[dev-dependencies]
+# Turns usermode-backend on for this crate's own tests. Packaging strips this,
+# so the files in tests/ gate themselves on the feature.
+ntalloc = { path = ".", features = ["usermode-backend"] }
+
+# Runs without the standard test harness; tests/global_allocator.rs says why.
+[[test]]
+name = "global_allocator"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

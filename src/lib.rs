@@ -57,6 +57,22 @@
 //!   `Rc`, or using a `BTreeMap` at all, needs `AllocatorClone`. Off by
 //!   default, because on a nightly that predates these traits, enabling it
 //!   fails to compile.
+//! - **`usermode-backend`** — for tests only. Allocates from the process heap
+//!   (`std::alloc::System`) instead of the kernel pool, so code that allocates
+//!   through [`NtAlloc`] can run in tests on a normal machine. Where the pool
+//!   would bugcheck with `BAD_POOL_CALLER`, the test aborts instead: on a
+//!   double free, on a pointer it never handed out, and, with
+//!   `TAGGED_DEALLOC`, on the wrong tag. It brings in `std`, so enable it
+//!   only under `[dev-dependencies]`: through a normal dependency it reaches
+//!   the driver itself, which then fails to build with a duplicate
+//!   `panic_impl` lang item, as `std`'s panic handler clashes with the
+//!   driver's own. [`NtAlloc::kernel_allocate`] always uses the pool, with or
+//!   without it.
+//!
+//!   ```toml
+//!   [dev-dependencies]
+//!   ntalloc = { version = "0.1", features = ["usermode-backend"] }
+//!   ```
 
 #![no_std]
 #![feature(allocator_api)]
@@ -66,6 +82,8 @@
 #![deny(missing_docs)]
 
 extern crate alloc;
+#[cfg(any(test, feature = "usermode-backend"))]
+extern crate std;
 
 mod bindings;
 
@@ -194,6 +212,63 @@ pub const POINTER_SIZE: usize = size_of::<*const u8>();
 /// pointers: 16 bytes on 64-bit targets, 8 bytes on 32-bit).
 pub const MIN_ALIGNMENT: usize = POINTER_SIZE * 2;
 
+/// A live block of the process-heap backend, as recorded in
+/// [`USERMODE_BLOCKS`].
+#[cfg(any(test, feature = "usermode-backend"))]
+struct UsermodeBlock {
+    /// The size it was allocated with, from which its layout follows.
+    size: usize,
+    /// The `MEMORY_TAG` of the configuration that allocated it.
+    tag: u32,
+}
+
+/// The map behind [`USERMODE_BLOCKS`], from block address to record, with its
+/// memory from `System`. It hashes with `DefaultHasher` under fixed keys
+/// rather than random ones: random keys protect against input chosen to
+/// collide, and the input here is addresses the heap picked.
+#[cfg(any(test, feature = "usermode-backend"))]
+type UsermodeBlockTable = std::collections::HashMap<
+    usize,
+    UsermodeBlock,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+    std::alloc::System,
+>;
+
+/// Live blocks of the process-heap backend, by address.
+///
+/// It lets [`NtAlloc::deallocate`] free a block from its pointer alone, as
+/// `ExFreePool` does. It also turns the frees for which the pool would
+/// bugcheck with `BAD_POOL_CALLER` into an abort, rather than heap corruption
+/// or a passing test: a pointer the backend never handed out, one already
+/// freed, and, with `TAGGED_DEALLOC`, one freed with the wrong tag.
+///
+/// It is a hash map, so recording or finding a block takes constant time on
+/// average, however many are live. Its own storage comes from `System`
+/// directly, never from the global allocator, which may be this crate.
+/// `HashMap` has no `const` constructor that takes an allocator, so
+/// [`with_usermode_blocks`] creates the map on first use.
+///
+/// A size header just before each block would be simpler, but freeing would
+/// then read memory outside the block through the caller's pointer. Rust's
+/// aliasing rules forbid that once the caller has narrowed the pointer to the
+/// block, as the standard library does through `Box`.
+#[cfg(any(test, feature = "usermode-backend"))]
+static USERMODE_BLOCKS: std::sync::Mutex<Option<UsermodeBlockTable>> = std::sync::Mutex::new(None);
+
+/// Runs `f` on the table of live blocks while holding its lock, creating the
+/// table on first use. The table allocates only from `System`, so working on
+/// it never calls back into this crate's allocator, which would try to take
+/// the lock it already holds.
+#[cfg(any(test, feature = "usermode-backend"))]
+fn with_usermode_blocks<R>(f: impl FnOnce(&mut UsermodeBlockTable) -> R) -> R {
+    let mut table = USERMODE_BLOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(table.get_or_insert_with(|| {
+        UsermodeBlockTable::with_hasher_in(std::hash::BuildHasherDefault::new(), std::alloc::System)
+    }))
+}
+
 impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
@@ -317,25 +392,33 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         }
     }
 
-    /// Test-only stand-in for [`NtAlloc::kernel_allocate`]: allocates `size`
-    /// bytes from the ordinary usermode heap, so the allocator's alignment
-    /// and pointer-stashing logic can be exercised by `cargo test` without a
-    /// running kernel.
+    /// Stand-in for [`NtAlloc::kernel_allocate`] in this crate's own tests and
+    /// under the `usermode-backend` feature: allocates `size` bytes from the
+    /// process heap, so the allocator's alignment and pointer-stashing logic
+    /// can run without a kernel.
     ///
-    /// Guards zero exactly as [`NtAlloc::kernel_allocate`] does — `alloc` has
-    /// the same non-zero requirement `ExAllocatePool2` has — so that the
-    /// shipped path carries no check its backend already makes.
+    /// It mirrors the pool wherever the rest of the crate relies on it:
     ///
-    /// Mirrors the pool's zeroing too, via [`NtAlloc::POOL_ZEROES`]. `alloc`
-    /// promises nothing about initialization while `ExAllocatePool2` always
-    /// zeroes, so without this the tests would exercise a backend that
-    /// behaves differently from the shipped one on exactly the property
-    /// [`GlobalAlloc::alloc_zeroed`] depends on.
+    /// - The block is aligned as `ExAllocatePool2` aligns one, to
+    ///   [`NtAlloc::kernel_alignment`] for `size`.
+    /// - It is freed from its pointer alone, as `ExFreePool` frees one, so
+    ///   [`NtAlloc::deallocate`] needs no `Layout`: every live block is
+    ///   recorded in [`USERMODE_BLOCKS`].
+    /// - It is zeroed unless the pool would leave it uninitialized, via
+    ///   [`NtAlloc::POOL_ZEROES`]; otherwise the tests would exercise a
+    ///   backend that differs from the shipped one on exactly the property
+    ///   [`GlobalAlloc::alloc_zeroed`] depends on.
+    /// - A zero `size` returns null without allocating, as in
+    ///   [`NtAlloc::kernel_allocate`], and so does a size too large to
+    ///   allocate, for which `ExAllocatePool2` would return null too.
+    /// - It refuses the same configurations, through
+    ///   [`NtAlloc::CONFIGURATION_SUPPORTED`], so a configuration the shipped
+    ///   path will not build cannot pass its tests.
     ///
-    /// It refuses the same configurations too, through
-    /// [`NtAlloc::CONFIGURATION_SUPPORTED`], so a configuration the shipped
-    /// path will not build cannot pass its tests.
-    #[cfg(test)]
+    /// The heap is `std::alloc::System`, not the global allocator: with this
+    /// crate as the `#[global_allocator]`, the global allocator would be this
+    /// function, and it would recurse until the stack overflowed.
+    #[cfg(any(test, feature = "usermode-backend"))]
     #[inline(always)]
     fn usermode_allocate(size: usize) -> *mut u8 {
         let () = Self::CONFIGURATION_SUPPORTED;
@@ -344,21 +427,39 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return null_mut();
         }
 
-        let layout = Layout::from_size_align(size, Self::kernel_alignment(size))
-            .expect("Failed to create layout");
+        let Ok(layout) = Layout::from_size_align(size, Self::kernel_alignment(size)) else {
+            return null_mut();
+        };
 
-        unsafe {
+        // SAFETY: `layout` has a non-zero size.
+        let block = unsafe {
             if Self::POOL_ZEROES {
-                alloc::alloc::alloc_zeroed(layout)
+                std::alloc::System.alloc_zeroed(layout)
             } else {
-                alloc::alloc::alloc(layout)
+                std::alloc::System.alloc(layout)
             }
+        };
+
+        if !block.is_null() {
+            let record = UsermodeBlock {
+                size,
+                tag: MEMORY_TAG,
+            };
+            let previous = with_usermode_blocks(|blocks| blocks.insert(block.addr(), record));
+            debug_assert!(
+                previous.is_none(),
+                "the heap returned an address the backend still records as live"
+            );
         }
+
+        block
     }
 
     /// Allocates `size` bytes directly from the kernel pool via
-    /// `ExAllocatePool2`, bypassing the usermode-test shim used by
-    /// [`NtAlloc::allocate`].
+    /// `ExAllocatePool2`, bypassing the process-heap backend that
+    /// [`NtAlloc::allocate`] uses in tests and under the `usermode-backend`
+    /// feature. It always reaches the pool, so outside a kernel it can only
+    /// be called with a `size` of `0`.
     ///
     /// # Parameters
     /// - `size`: the number of bytes to allocate. A zero-size request never
@@ -394,9 +495,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Allocates `size` bytes, returning a null pointer for a zero-size
     /// request.
     ///
-    /// Under `#[cfg(test)]`, allocation is redirected to the ordinary
-    /// usermode heap so this crate's own tests can exercise the allocator's
-    /// logic without a kernel; otherwise this calls [`NtAlloc::kernel_allocate`].
+    /// With the `usermode-backend` feature, and in this crate's own tests,
+    /// allocation is redirected to the process heap so that the allocator's
+    /// logic can run without a kernel; otherwise this calls
+    /// [`NtAlloc::kernel_allocate`].
     ///
     /// The zero-size check lives in each backend rather than here, so the
     /// shipped path performs it once instead of twice.
@@ -420,12 +522,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// unsafe { Alloc::deallocate(ptr) };
     /// ```
     pub fn allocate(size: usize) -> *mut u8 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "usermode-backend"))]
         {
             Self::usermode_allocate(size)
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "usermode-backend")))]
         {
             Self::kernel_allocate(size)
         }
@@ -647,6 +749,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// safe no-op) and must have been allocated from the same pool with the
     /// same `MEMORY_TAG`; passing a pointer allocated with a different tag
     /// corrupts the pool.
+    // The heap backend frees through usermode_free instead; these stay
+    // compiled, and checked, in every configuration.
+    #[cfg_attr(any(test, feature = "usermode-backend"), allow(dead_code))]
     fn deallocate_tagged(ptr: *mut u8) {
         unsafe {
             ExFreePoolWithTag(ptr.cast(), MEMORY_TAG);
@@ -658,15 +763,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// `ptr` must be non-null (unlike C's `free`, passing null here is not a
     /// safe no-op) and must have been allocated from the same pool as this
     /// allocator targets.
+    #[cfg_attr(any(test, feature = "usermode-backend"), allow(dead_code))]
     fn deallocate_non_tagged(ptr: *mut u8) {
         unsafe {
             ExFreePool(ptr.cast());
         }
     }
 
-    /// Frees a pointer previously returned by [`NtAlloc::kernel_allocate`] (or
-    /// [`NtAlloc::allocate`] outside of tests), using the free routine
-    /// selected by `TAGGED_DEALLOC`.
+    /// Frees a pointer previously returned by [`NtAlloc::allocate`]. Normally
+    /// that is a pool block, which [`NtAlloc::kernel_allocate`] returns too,
+    /// freed with the routine `TAGGED_DEALLOC` selects. Under the
+    /// `usermode-backend` feature both functions use the process heap instead.
     ///
     /// This does **not** account for the pointer-stashing done by
     /// [`NtAlloc::allocate_aligned`] for over-aligned requests — see that
@@ -699,32 +806,57 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// unsafe { Alloc::deallocate(ptr) };
     /// ```
     pub unsafe fn deallocate(ptr: *mut u8) {
-        if TAGGED_DEALLOC {
-            Self::deallocate_tagged(ptr);
-        } else {
-            Self::deallocate_non_tagged(ptr);
+        #[cfg(any(test, feature = "usermode-backend"))]
+        {
+            Self::usermode_free(ptr);
+        }
+
+        #[cfg(not(any(test, feature = "usermode-backend")))]
+        {
+            if TAGGED_DEALLOC {
+                Self::deallocate_tagged(ptr);
+            } else {
+                Self::deallocate_non_tagged(ptr);
+            }
         }
     }
 
-    /// Test-only counterpart to [`NtAlloc::usermode_allocate`]: frees a
-    /// pointer previously produced by it, reconstructing the exact
-    /// [`Layout`] that was used to allocate it (including any extra bytes
-    /// added for realignment), since the usermode global allocator requires
-    /// the original layout to deallocate correctly.
-    #[cfg(test)]
-    fn usermode_deallocate(original_ptr: *mut u8, layout: Layout) {
-        let allocated_size = layout.size()
-            + if Self::is_kernel_aligned(layout) {
-                0
-            } else {
-                layout.align()
-            };
+    /// Frees a block from [`NtAlloc::usermode_allocate`] given only its
+    /// pointer, as `ExFreePool` frees a pool block, by looking it up in
+    /// [`USERMODE_BLOCKS`].
+    ///
+    /// Where the pool would bugcheck with `BAD_POOL_CALLER`, this aborts the
+    /// process: for a pointer the backend never handed out, for one already
+    /// freed, and, when `TAGGED_DEALLOC` selects `ExFreePoolWithTag`, for a
+    /// block allocated under a different `MEMORY_TAG`.
+    #[cfg(any(test, feature = "usermode-backend"))]
+    fn usermode_free(ptr: *mut u8) {
+        let block = with_usermode_blocks(|blocks| blocks.remove(&ptr.addr()));
 
+        let Some(block) = block else {
+            std::eprintln!(
+                "ntalloc: freed {ptr:p}, which the usermode backend never allocated or has \
+                 already freed"
+            );
+            std::process::abort();
+        };
+
+        if TAGGED_DEALLOC && block.tag != MEMORY_TAG {
+            std::eprintln!(
+                "ntalloc: freed {ptr:p} with tag '{}', but it was allocated with tag '{}'",
+                MEMORY_TAG.to_ne_bytes().escape_ascii(),
+                block.tag.to_ne_bytes().escape_ascii(),
+            );
+            std::process::abort();
+        }
+
+        // SAFETY: `ptr` is a live block from usermode_allocate, which allocated
+        // it with this size and alignment and recorded it; the record is now
+        // removed, so the block is freed exactly once.
         unsafe {
-            alloc::alloc::dealloc(
-                original_ptr,
-                Layout::from_size_align(allocated_size, Self::kernel_alignment(allocated_size))
-                    .expect("Failed to create layout"),
+            std::alloc::System.dealloc(
+                ptr,
+                Layout::from_size_align_unchecked(block.size, Self::kernel_alignment(block.size)),
             );
         }
     }
@@ -780,16 +912,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             "Original pointer is null. This may indicate that the pointer was not allocated by this allocator or has already been deallocated."
         );
 
-        #[cfg(test)]
-        Self::usermode_deallocate(original_ptr, layout);
-
-        #[cfg(not(test))]
-        // SAFETY: original_ptr is the pool's own address — either `ptr`
-        // itself when no realignment happened, or the value stashed by
+        // SAFETY: original_ptr is the address `allocate` returned — either
+        // `ptr` itself when no realignment happened, or the value stashed by
         // allocate_aligned — and this fn's own contract covers the rest.
-        unsafe {
-            Self::deallocate(original_ptr)
-        };
+        unsafe { Self::deallocate(original_ptr) };
     }
 }
 
@@ -1277,8 +1403,8 @@ mod tests {
 
     #[test]
     fn kernel_allocate_guards_zero_without_reaching_the_pool() {
-        // kernel_allocate has no cfg(test) shim, so this genuinely calls the
-        // shipped code path. It is safe to run in a test binary for exactly
+        // kernel_allocate never uses the heap backend, so this genuinely calls
+        // the shipped code path. It is safe to run in a test binary for exactly
         // one argument: 0, where the guard returns before ExAllocatePool2.
         // Remove the guard and this reaches the pool from user mode and dies.
         assert!(PagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(0).is_null());
