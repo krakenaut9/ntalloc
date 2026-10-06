@@ -112,10 +112,12 @@ fn an_impossible_size_is_null_not_a_panic() {
 
 /// Runs `test` from this binary in a child process with `trigger` set, for
 /// misuse that ends the process, and returns what the child wrote to stderr.
+///
+/// The child keeps the harness's usual output capture, as a consumer's tests
+/// would, so this also checks that the backend's message survives the abort.
 fn run_aborting_child(test: &str, trigger: &str) -> String {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        // Uncaptured, so the backend's message survives the abort.
-        .args(["--exact", test, "--nocapture"])
+        .args(["--exact", test])
         .env(trigger, "1")
         .output()
         .unwrap();
@@ -174,6 +176,38 @@ fn freeing_with_the_wrong_tag_aborts() {
         stderr.contains("with tag 'Othr', but it was allocated with tag 'Rust'"),
         "{stderr}"
     );
+}
+
+/// A block freed behind the backend's back, here straight to `System`, aborts
+/// as soon as the heap hands its address out again, rather than the backend
+/// taking the new block for the old one.
+#[test]
+#[cfg_attr(miri, ignore = "Miri cannot start processes")]
+fn freeing_outside_the_backend_aborts() {
+    if std::env::var_os("NTALLOC_FREED_OUTSIDE_CHILD").is_some() {
+        let layout = Layout::from_size_align(64, Paged::kernel_alignment(64)).unwrap();
+        let ptr = Paged::allocate(64);
+        assert!(!ptr.is_null());
+        // SAFETY: `System` handed out `ptr` for exactly this layout, so freeing
+        // it there is sound. It is still a misuse, on purpose: the backend
+        // records the block as live, which is what this test is about.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+
+        // The heap reuses a freed block within a few allocations of its size,
+        // and the backend must abort when it does. The bound only stops a heap
+        // that never reuses it from running forever.
+        let mut kept = Vec::with_capacity(1_000_000);
+        for _ in 0..1_000_000 {
+            kept.push(Paged::allocate(64));
+        }
+        unreachable!("the heap never handed the address out again");
+    }
+
+    let stderr = run_aborting_child(
+        "freeing_outside_the_backend_aborts",
+        "NTALLOC_FREED_OUTSIDE_CHILD",
+    );
+    assert!(stderr.contains("again while it was live"), "{stderr}");
 }
 
 /// Every allocation and free updates one table shared by all threads.

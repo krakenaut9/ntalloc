@@ -60,14 +60,16 @@
 //! - **`usermode-backend`** — for tests only. Allocates from the process heap
 //!   (`std::alloc::System`) instead of the kernel pool, so code that allocates
 //!   through [`NtAlloc`] can run in tests on a normal machine. Where the pool
-//!   would bugcheck with `BAD_POOL_CALLER`, the test aborts instead: on a
-//!   double free, on a pointer it never handed out, and, with
-//!   `TAGGED_DEALLOC`, on the wrong tag. It brings in `std`, so enable it
-//!   only under `[dev-dependencies]`: through a normal dependency it reaches
-//!   the driver itself, which then fails to build with a duplicate
-//!   `panic_impl` lang item, as `std`'s panic handler clashes with the
-//!   driver's own. [`NtAlloc::kernel_allocate`] always uses the pool, with or
-//!   without it.
+//!   would bugcheck with `BAD_POOL_CALLER`, the test process prints what went
+//!   wrong and aborts instead: on a double free, on a pointer it never handed
+//!   out, and, with `TAGGED_DEALLOC`, on the wrong tag. On Windows any abort
+//!   is reported as `STATUS_STACK_BUFFER_OVERRUN`, whatever its cause, and
+//!   running the tests with `-- --test-threads=1` shows which test it was.
+//!   It brings in `std`, so enable it only under `[dev-dependencies]`:
+//!   through a normal dependency it reaches the driver itself, which then
+//!   fails to build with a duplicate `panic_impl` lang item, as `std`'s panic
+//!   handler clashes with the driver's own. [`NtAlloc::kernel_allocate`]
+//!   always uses the pool, with or without it.
 //!
 //!   ```toml
 //!   [dev-dependencies]
@@ -216,8 +218,8 @@ pub const MIN_ALIGNMENT: usize = POINTER_SIZE * 2;
 /// [`USERMODE_BLOCKS`].
 #[cfg(any(test, feature = "usermode-backend"))]
 struct UsermodeBlock {
-    /// The size it was allocated with, from which its layout follows.
-    size: usize,
+    /// The layout it was allocated with, which freeing it needs again.
+    layout: Layout,
     /// The `MEMORY_TAG` of the configuration that allocated it.
     tag: u32,
 }
@@ -267,6 +269,23 @@ fn with_usermode_blocks<R>(f: impl FnOnce(&mut UsermodeBlockTable) -> R) -> R {
     f(table.get_or_insert_with(|| {
         UsermodeBlockTable::with_hasher_in(std::hash::BuildHasherDefault::new(), std::alloc::System)
     }))
+}
+
+/// Reports a misuse of the process-heap backend, then aborts the process.
+///
+/// It aborts rather than panics because it runs inside `GlobalAlloc` and
+/// `Allocator` methods, neither of which may unwind. The message goes straight
+/// to stderr rather than through `eprintln!`: the test harness captures
+/// `eprintln!` output and only shows it once a test has finished, which an
+/// aborted test never does.
+#[cfg(any(test, feature = "usermode-backend"))]
+#[cold]
+fn usermode_misuse(message: core::fmt::Arguments<'_>) -> ! {
+    use std::io::Write as _;
+
+    // Nothing useful can be done if stderr itself fails.
+    let _ = writeln!(std::io::stderr(), "ntalloc: {message}");
+    std::process::abort()
 }
 
 impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
@@ -442,14 +461,17 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
         if !block.is_null() {
             let record = UsermodeBlock {
-                size,
+                layout,
                 tag: MEMORY_TAG,
             };
             let previous = with_usermode_blocks(|blocks| blocks.insert(block.addr(), record));
-            debug_assert!(
-                previous.is_none(),
-                "the heap returned an address the backend still records as live"
-            );
+            // The heap reuses an address only once it is free, so a live record
+            // here means the block was freed behind the backend's back.
+            if previous.is_some() {
+                usermode_misuse(format_args!(
+                    "the heap handed out {block:p} again while it was live: freed outside NtAlloc?"
+                ));
+            }
         }
 
         block
@@ -825,40 +847,33 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// pointer, as `ExFreePool` frees a pool block, by looking it up in
     /// [`USERMODE_BLOCKS`].
     ///
-    /// Where the pool would bugcheck with `BAD_POOL_CALLER`, this aborts the
-    /// process: for a pointer the backend never handed out, for one already
-    /// freed, and, when `TAGGED_DEALLOC` selects `ExFreePoolWithTag`, for a
-    /// block allocated under a different `MEMORY_TAG`.
+    /// Where the pool would bugcheck with `BAD_POOL_CALLER`, this reports the
+    /// misuse and aborts the process, through [`usermode_misuse`]: for a
+    /// pointer the backend never handed out, for one already freed, and, when
+    /// `TAGGED_DEALLOC` selects `ExFreePoolWithTag`, for a block allocated
+    /// under a different `MEMORY_TAG`.
     #[cfg(any(test, feature = "usermode-backend"))]
     fn usermode_free(ptr: *mut u8) {
         let block = with_usermode_blocks(|blocks| blocks.remove(&ptr.addr()));
 
         let Some(block) = block else {
-            std::eprintln!(
-                "ntalloc: freed {ptr:p}, which the usermode backend never allocated or has \
-                 already freed"
-            );
-            std::process::abort();
+            usermode_misuse(format_args!(
+                "freed {ptr:p}, which the usermode backend never allocated or has already freed"
+            ));
         };
 
         if TAGGED_DEALLOC && block.tag != MEMORY_TAG {
-            std::eprintln!(
-                "ntalloc: freed {ptr:p} with tag '{}', but it was allocated with tag '{}'",
+            usermode_misuse(format_args!(
+                "freed {ptr:p} with tag '{}', but it was allocated with tag '{}'",
                 MEMORY_TAG.to_ne_bytes().escape_ascii(),
                 block.tag.to_ne_bytes().escape_ascii(),
-            );
-            std::process::abort();
+            ));
         }
 
-        // SAFETY: `ptr` is a live block from usermode_allocate, which allocated
-        // it with this size and alignment and recorded it; the record is now
-        // removed, so the block is freed exactly once.
-        unsafe {
-            std::alloc::System.dealloc(
-                ptr,
-                Layout::from_size_align_unchecked(block.size, Self::kernel_alignment(block.size)),
-            );
-        }
+        // SAFETY: `ptr` is a live block that usermode_allocate allocated with
+        // `block.layout` and recorded; the record is now removed, so the block
+        // is freed exactly once.
+        unsafe { std::alloc::System.dealloc(ptr, block.layout) };
     }
 
     /// Frees a pointer returned by [`NtAlloc::allocate_aligned`] for `layout`,
