@@ -301,7 +301,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// guaranteed to exist, and to belong to the caller, for such a pointer.
     /// That restriction is why this is not part of the public API: nothing
     /// in the signature can enforce it.
-    #[inline(always)]
+    #[inline]
     #[expect(
         clippy::cast_ptr_alignment,
         reason = "a realigned address is aligned to more than MIN_ALIGNMENT"
@@ -323,7 +323,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// [`MIN_ALIGNMENT`], which is two pointers wide. `original_ptr` is the
     /// pointer the underlying allocation actually returned, to be restored
     /// on deallocation.
-    #[inline(always)]
+    #[inline]
     fn save_original_pointer(ptr: *mut u8, original_ptr: *mut u8) {
         let original_ptr_location = Self::original_pointer_location(ptr);
         // SAFETY: the slot lies in the gap allocate_aligned opened before `ptr`,
@@ -340,7 +340,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// `ptr` must be a pointer returned by [`NtAlloc::allocate_aligned`] for
     /// which realignment was required; for any other pointer the slot read
     /// here holds unrelated memory.
-    #[inline(always)]
+    #[inline]
     fn original_pointer(ptr: *mut u8) -> *mut u8 {
         let original_ptr_location = Self::original_pointer_location(ptr);
         // SAFETY: this is the slot save_original_pointer wrote when
@@ -374,7 +374,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// assert_eq!(Alloc::kernel_alignment(PAGE_SIZE as usize), PAGE_SIZE as usize);
     /// ```
     #[must_use]
-    #[inline(always)]
+    #[inline]
     pub fn kernel_alignment(size: usize) -> usize {
         if size >= PAGE_SIZE as usize {
             PAGE_SIZE as usize
@@ -408,7 +408,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// assert!(!ptr.is_null());
     /// ```
     #[must_use = "discarding the pointer leaks the allocation"]
-    #[inline(always)]
+    #[inline]
     pub fn kernel_allocate(size: usize) -> *mut u8 {
         // Fails the build, not anything at runtime, for a configuration this
         // crate refuses; see CONFIGURATION_SUPPORTED.
@@ -484,7 +484,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// checked by `free_path_decision_cannot_flip`.
     ///
     /// [`Allocator::deallocate`]: core::alloc::Allocator::deallocate
-    #[inline(always)]
+    #[inline]
     fn is_kernel_aligned(layout: Layout) -> bool {
         let pool_alignment = Self::kernel_alignment(layout.size());
 
@@ -527,7 +527,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// of the address space combined with a large `alignment` would wrap
     /// silently — worth noting since kernel-mode pointers often sit near
     /// that boundary.
-    #[inline(always)]
+    #[inline]
     fn align_up_to(allocated_buffer: *mut u8, alignment: NonZeroUsize) -> *mut u8 {
         debug_assert!(
             alignment.is_power_of_two(),

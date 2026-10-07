@@ -107,7 +107,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// The heap is `std::alloc::System`, not the global allocator: with this
     /// crate as the `#[global_allocator]`, the global allocator would be this
     /// function, and it would recurse until the stack overflowed.
-    #[inline(always)]
+    #[inline]
     pub(crate) fn usermode_allocate(size: usize) -> *mut u8 {
         let () = Self::CONFIGURATION_SUPPORTED;
 
