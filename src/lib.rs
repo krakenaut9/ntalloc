@@ -303,6 +303,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// in the signature can enforce it.
     #[inline(always)]
     fn original_pointer_location(ptr: *mut u8) -> *mut *mut u8 {
+        // SAFETY: `ptr` is an address allocate_aligned realigned, which lies at
+        // least MIN_ALIGNMENT bytes into the same pool block, so one pointer
+        // back is still inside it.
         unsafe { (ptr.cast::<*mut u8>()).offset(-1) }
     }
 
@@ -319,6 +322,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     #[inline(always)]
     fn save_original_pointer(ptr: *mut u8, original_ptr: *mut u8) {
         let original_ptr_location = Self::original_pointer_location(ptr);
+        // SAFETY: the slot lies in the gap allocate_aligned opened before `ptr`,
+        // inside the pool block and outside the region handed out, and is
+        // pointer-aligned because `ptr` is aligned to more than MIN_ALIGNMENT.
         unsafe {
             *original_ptr_location = original_ptr;
         }
@@ -333,6 +339,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     #[inline(always)]
     fn original_pointer(ptr: *mut u8) -> *mut u8 {
         let original_ptr_location = Self::original_pointer_location(ptr);
+        // SAFETY: this is the slot save_original_pointer wrote when
+        // allocate_aligned handed `ptr` out; nothing else writes to it.
         unsafe { *original_ptr_location }
     }
 
@@ -404,6 +412,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return null_mut();
         }
 
+        // SAFETY: ExAllocatePool2 takes no pointers: only the flags and tag,
+        // which CONFIGURATION_SUPPORTED has checked, and a non-zero size. The
+        // paged pool's IRQL limit is documented on PagedAlloc.
         unsafe { ExAllocatePool2(ALLOC_POOL_FLAGS, size, MEMORY_TAG) as *mut u8 }
     }
 
@@ -658,6 +669,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             // decision. This line is load-bearing; see is_kernel_aligned.
             let allocated_slice = slice_from_raw_parts_mut(allocated_raw, layout.size());
 
+            // SAFETY: allocated_raw was checked non-null above, and the slice
+            // pointer keeps its address.
             Ok(unsafe { NonNull::new_unchecked(allocated_slice) })
         }
     }
@@ -673,6 +686,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     // compiled, and checked, in every configuration.
     #[cfg_attr(any(test, feature = "usermode-backend"), allow(dead_code))]
     fn deallocate_tagged(ptr: *mut u8) {
+        // SAFETY: the only caller, deallocate, passes on its own contract: a
+        // non-null pool block of this configuration, allocated with this
+        // MEMORY_TAG and not yet freed.
         unsafe {
             ExFreePoolWithTag(ptr.cast(), MEMORY_TAG);
         }
@@ -685,6 +701,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// allocator targets.
     #[cfg_attr(any(test, feature = "usermode-backend"), allow(dead_code))]
     fn deallocate_non_tagged(ptr: *mut u8) {
+        // SAFETY: the only caller, deallocate, passes on its own contract: a
+        // non-null pool block of this configuration, not yet freed.
         unsafe {
             ExFreePool(ptr.cast());
         }
@@ -799,6 +817,20 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     }
 }
 
+// SAFETY: [`GlobalAlloc`] asks for blocks that fit the layout and stay valid
+// until freed, and for no method to unwind. For [`NtAlloc`]:
+//
+// - `alloc` returns null or `layout.size()` bytes aligned to `layout.align()`:
+//   the pool's own block when its alignment suffices, otherwise an address
+//   realigned inside a block over-allocated by `layout.align()`;
+// - a block belongs to the pool, not to the allocator value, so it stays valid
+//   until `dealloc` hands it back, recovering the pool's own address from the
+//   same layout;
+// - `alloc_zeroed` returns zeroed memory: the pool zeroes it unless
+//   [`POOL_FLAG_UNINITIALIZED`] is set, and then it writes the zeroes itself;
+// - in a release build nothing on the pool path panics; its `debug_assert!`s
+//   fire only on a bug here or on a caller that broke the contract, and the
+//   heap backend aborts rather than unwinds on misuse.
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     GlobalAlloc for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {
@@ -865,6 +897,19 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     }
 }
 
+// SAFETY: [`Allocator`] asks that a block stay valid until it is deallocated,
+// however the allocator value is copied, moved or dropped, and that a copy
+// behave like the original. For [`NtAlloc`]:
+//
+// - blocks come from the pool (or the heap backend), never from the value,
+//   which is a zero-sized `Copy` type that owns nothing, so no copy, move or
+//   drop of it can invalidate one;
+// - every value of one type makes the same pool calls, so any of them can free
+//   what another allocated;
+// - `allocate` reports exactly `layout.size()` bytes, so the layout the free
+//   path receives is the one the stash decision was made with;
+// - a zero-size request gets a dangling, aligned pointer, which `deallocate`
+//   recognizes and never frees.
 #[cfg(feature = "allocator-api")]
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>

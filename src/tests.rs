@@ -293,15 +293,20 @@ fn allocator_grow_from_zero_and_shrink_to_zero() {
     assert_eq!(empty.len(), 0);
 
     // Growing away from the dangling pointer must not try to free it.
+    // SAFETY: `empty` came from this allocator with `empty_layout`, and
+    // `full_layout` is no smaller.
     let grown =
         unsafe { allocator.grow(empty.cast(), empty_layout, full_layout) }.expect("grow from zero");
     assert_eq!(grown.len(), 64);
 
     // Shrinking to zero must still release the real allocation.
+    // SAFETY: `grown` came from `grow` with `full_layout`, and `empty_layout`
+    // is no larger.
     let shrunk = unsafe { allocator.shrink(grown.cast(), full_layout, empty_layout) }
         .expect("shrink to zero");
     assert_eq!(shrunk.len(), 0);
 
+    // SAFETY: `shrunk` came from `shrink` with `empty_layout`.
     unsafe { allocator.deallocate(shrunk.cast(), empty_layout) };
 }
 
@@ -316,6 +321,7 @@ fn allocator_zeroed_accepts_zero_sized_layouts() {
         .expect("zero-size allocate_zeroed");
 
     assert_eq!(empty.len(), 0);
+    // SAFETY: `empty` came from `allocate_zeroed` with `layout`.
     unsafe { allocator.deallocate(empty.cast(), layout) };
 }
 
