@@ -88,10 +88,13 @@
 
 #![no_std]
 #![cfg_attr(feature = "allocator-api", feature(allocator_api))]
-#![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(unsafe_code)]
 #![deny(missing_docs)]
+// Doctests are this crate's documentation, so let them fail on unused imports
+// rather than accumulating stale `use` lines. Scoped to `unused` rather than
+// all warnings: this only ever runs for our own doctests, but a blanket deny
+// would also break on an unrelated future lint in a dependency's API.
+#![doc(test(attr(deny(unused))))]
 
 #[cfg(any(test, feature = "usermode-backend"))]
 extern crate std;

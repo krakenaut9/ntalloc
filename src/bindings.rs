@@ -18,6 +18,7 @@
 /// cannot satisfy them all, the allocation fails. The high 32 bits are
 /// optional flags, which the pool satisfies when it can and ignores when it
 /// does not recognise them.
+#[allow(non_camel_case_types, reason = "named as in wdm.h")]
 pub type POOL_FLAGS = u64;
 
 /// Charge the allocation to the pool quota of the process the allocating

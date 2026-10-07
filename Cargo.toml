@@ -48,6 +48,14 @@ hashbrown = { version = "0.17", default-features = false, features = ["allocator
 name = "global_allocator"
 harness = false
 
+# Kept here rather than in a CI command line so that a local `cargo clippy`
+# matches CI. Groups take priority -1 so that single lints can override them.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Every unsafe block says why it is sound.
+undocumented_unsafe_blocks = "warn"
+
 [package.metadata.docs.rs]
 # The features that add API. usermode-backend adds none, and with it in the
 # build rustdoc would also list its dependencies' blanket impls on NtAlloc.
