@@ -3,6 +3,14 @@ name = "ntalloc"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "Windows kernel pool allocator (ExAllocatePool2) for no_std Rust drivers."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/krakenaut9/ntalloc"
+documentation = "https://docs.rs/ntalloc"
+keywords = ["allocator", "kernel", "windows", "driver", "pool"]
+categories = ["no-std", "os::windows-apis", "memory-management"]
+include = ["src/**", "tests/**", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE*"]
+authors = ["Dmytro Maslo <krakenaut9@gmail.com>"]
 
 [dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices"] }
@@ -44,3 +52,6 @@ harness = false
 # The features that add API. usermode-backend adds none, and with it in the
 # build rustdoc would also list its dependencies' blanket impls on NtAlloc.
 features = ["allocator-api", "allocator-api-markers"]
+# Windows only: docs.rs would otherwise also build Linux and macOS docs and
+# open the crate on Linux.
+targets = ["x86_64-pc-windows-msvc"]
