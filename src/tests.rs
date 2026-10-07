@@ -15,12 +15,14 @@ fn require_realignment_test() {
         if alignment <= MIN_ALIGNMENT {
             assert!(
                 already_satisfied,
-                "alignment {alignment} is within MIN_ALIGNMENT, so the pool                      should already satisfy it and no realignment is needed"
+                "alignment {alignment} is within MIN_ALIGNMENT, so the pool \
+                 should already satisfy it and no realignment is needed"
             );
         } else {
             assert!(
                 !already_satisfied,
-                "alignment {alignment} exceeds what the pool guarantees for                      a {size}-byte request, so realignment is needed"
+                "alignment {alignment} exceeds what the pool guarantees for \
+                 a {size}-byte request, so realignment is needed"
             );
         }
     }
@@ -371,7 +373,8 @@ fn free_path_decision_cannot_flip() {
 
             assert_eq!(
                 reported, size,
-                "size {size} align {align}: allocate_slice must report the                      requested size, or the fitting range widens"
+                "size {size} align {align}: allocate_slice must report the \
+                 requested size, or the fitting range widens"
             );
 
             // Walk every size in min..=max that could change the answer.
@@ -380,7 +383,8 @@ fn free_path_decision_cannot_flip() {
                 assert_eq!(
                     !Alloc::is_kernel_aligned(other),
                     stashed,
-                    "size {size} align {align}: freeing with size {probe}                          (legal, max is {reported}) flips the stash decision"
+                    "size {size} align {align}: freeing with size {probe} \
+                     (legal, max is {reported}) flips the stash decision"
                 );
                 if probe >= reported {
                     break;
