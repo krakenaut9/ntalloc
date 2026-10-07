@@ -133,7 +133,7 @@ fn allocate_aligned_test_requires_realignment() {
     let layout = Layout::from_size_align(16, 64).unwrap();
     let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
     assert!(!aligned_ptr.is_null());
-    assert!((aligned_ptr as usize) % layout.align() == 0);
+    assert_eq!((aligned_ptr as usize) % layout.align(), 0);
 
     let original_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer(aligned_ptr);
     assert!(!original_ptr.is_null());
@@ -148,7 +148,7 @@ fn allocate_aligned_test_no_realignment() {
     let layout = Layout::from_size_align(16, 8).unwrap();
     let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
     assert!(!aligned_ptr.is_null());
-    assert!((aligned_ptr as usize) % layout.align() == 0);
+    assert_eq!((aligned_ptr as usize) % layout.align(), 0);
 
     // SAFETY: aligned_ptr came from allocate_aligned with this exact layout.
     unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
@@ -159,7 +159,7 @@ fn allocate_aligned_test_alignment_equal_to_page_size() {
     let layout = Layout::from_size_align(16, PAGE_SIZE as usize).unwrap();
     let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
     assert!(!aligned_ptr.is_null());
-    assert!((aligned_ptr as usize) % layout.align() == 0);
+    assert_eq!((aligned_ptr as usize) % layout.align(), 0);
 
     let original_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer(aligned_ptr);
     assert!(!original_ptr.is_null());
@@ -174,7 +174,7 @@ fn allocate_aligned_test_alignment_greater_than_page_size() {
     let layout = Layout::from_size_align(16, PAGE_SIZE as usize * 2).unwrap();
     let aligned_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
     assert!(!aligned_ptr.is_null());
-    assert!((aligned_ptr as usize) % layout.align() == 0);
+    assert_eq!((aligned_ptr as usize) % layout.align(), 0);
 
     let original_ptr = PagedAlloc::<DEFAULT_MEMORY_TAG, true>::original_pointer(aligned_ptr);
     assert!(!original_ptr.is_null());
@@ -272,8 +272,8 @@ fn allocator_accepts_zero_sized_layouts() {
             PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(
                 slice.as_ptr().cast::<u8>(),
                 layout,
-            )
-        };
+            );
+        }
     }
 }
 
@@ -504,8 +504,8 @@ fn an_uninitialized_pool_still_zeroes_where_it_promises_to() {
         assert!(
             !Uninit::POOL_ZEROES,
             "this configuration opts out of zeroing"
-        )
-    };
+        );
+    }
 
     let allocator = Uninit::default();
     let size = 512usize;

@@ -302,11 +302,15 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// That restriction is why this is not part of the public API: nothing
     /// in the signature can enforce it.
     #[inline(always)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "a realigned address is aligned to more than MIN_ALIGNMENT"
+    )]
     fn original_pointer_location(ptr: *mut u8) -> *mut *mut u8 {
         // SAFETY: `ptr` is an address allocate_aligned realigned, which lies at
         // least MIN_ALIGNMENT bytes into the same pool block, so one pointer
         // back is still inside it.
-        unsafe { (ptr.cast::<*mut u8>()).offset(-1) }
+        unsafe { ptr.cast::<*mut u8>().sub(1) }
     }
 
     /// Stores `original_ptr` in the pointer-sized slot immediately before
@@ -369,6 +373,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// assert_eq!(Alloc::kernel_alignment(16), MIN_ALIGNMENT);
     /// assert_eq!(Alloc::kernel_alignment(PAGE_SIZE as usize), PAGE_SIZE as usize);
     /// ```
+    #[must_use]
     #[inline(always)]
     pub fn kernel_alignment(size: usize) -> usize {
         if size >= PAGE_SIZE as usize {
@@ -402,6 +407,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(64);
     /// assert!(!ptr.is_null());
     /// ```
+    #[must_use = "discarding the pointer leaks the allocation"]
     #[inline(always)]
     pub fn kernel_allocate(size: usize) -> *mut u8 {
         // Fails the build, not anything at runtime, for a configuration this
@@ -415,7 +421,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         // SAFETY: ExAllocatePool2 takes no pointers: only the flags and tag,
         // which CONFIGURATION_SUPPORTED has checked, and a non-zero size. The
         // paged pool's IRQL limit is documented on PagedAlloc.
-        unsafe { ExAllocatePool2(ALLOC_POOL_FLAGS, size, MEMORY_TAG) as *mut u8 }
+        unsafe { ExAllocatePool2(ALLOC_POOL_FLAGS, size, MEMORY_TAG) }.cast()
     }
 
     /// Allocates `size` bytes, returning a null pointer for a zero-size
@@ -447,6 +453,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// // SAFETY: `ptr` came from `Alloc::allocate` and needed no realignment.
     /// unsafe { Alloc::deallocate(ptr) };
     /// ```
+    #[must_use = "discarding the pointer leaks the allocation"]
     pub fn allocate(size: usize) -> *mut u8 {
         #[cfg(any(test, feature = "usermode-backend"))]
         {
@@ -592,6 +599,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// // SAFETY: `ptr` came from `allocate_aligned` with this exact layout.
     /// unsafe { Alloc::deallocate_aligned(ptr, layout) };
     /// ```
+    #[must_use = "discarding the pointer leaks the allocation"]
     pub fn allocate_aligned(layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
             return null_mut();
@@ -948,8 +956,8 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
                 allocated
                     .cast::<u8>()
                     .as_ptr()
-                    .write_bytes(0, allocated.len())
-            };
+                    .write_bytes(0, allocated.len());
+            }
         }
 
         Ok(allocated)
