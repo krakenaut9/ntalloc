@@ -123,6 +123,12 @@ use windows_sys::Wdk::System::SystemServices::{
     ExAllocatePool2, ExFreePool, ExFreePoolWithTag, PAGE_SIZE,
 };
 
+// The README's examples are compiled as doctests, all but the nightly-only one,
+// which is marked ignore.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// Default memory tag for allocations, visible via kernel debugger pool
 /// inspection tools such as `!poolused`/`!poolfind`.
 ///
