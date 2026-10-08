@@ -44,9 +44,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+//! use ntalloc::NonPagedAlloc;
 //!
-//! type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
+//! type Alloc = NonPagedAlloc;
 //!
 //! let ptr = Alloc::allocate(64);
 //! assert!(!ptr.is_null());
@@ -180,6 +180,11 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 ///
 /// assert!(!ScratchAlloc::POOL_ZEROES);
 /// ```
+///
+/// Call associated functions through an alias that names the whole type, such
+/// as `type Alloc = NonPagedAlloc;` followed by `Alloc::allocate(64)`. Writing
+/// `NonPagedAlloc::allocate(64)` does not compile (E0284): Rust fills in the
+/// aliases' default parameters only where a type is expected.
 ///
 /// # Unsupported configurations
 ///
@@ -374,10 +379,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```
-    /// use ntalloc::{PagedAlloc, MIN_ALIGNMENT, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::{PagedAlloc, MIN_ALIGNMENT};
     /// use windows_sys::Wdk::System::SystemServices::PAGE_SIZE;
     ///
-    /// type Alloc = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
+    /// type Alloc = PagedAlloc;
     ///
     /// assert_eq!(Alloc::kernel_alignment(16), MIN_ALIGNMENT);
     /// assert_eq!(Alloc::kernel_alignment(PAGE_SIZE as usize), PAGE_SIZE as usize);
@@ -411,9 +416,11 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::NonPagedAlloc;
     ///
-    /// let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::kernel_allocate(64);
+    /// type Alloc = NonPagedAlloc;
+    ///
+    /// let ptr = Alloc::kernel_allocate(64);
     /// assert!(!ptr.is_null());
     /// ```
     #[must_use = "discarding the pointer leaks the allocation"]
@@ -453,9 +460,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::NonPagedAlloc;
     ///
-    /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
+    /// type Alloc = NonPagedAlloc;
     ///
     /// let ptr = Alloc::allocate(64);
     /// assert!(!ptr.is_null());
@@ -596,9 +603,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// # Examples
     /// ```no_run
     /// use core::alloc::Layout;
-    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::NonPagedAlloc;
     ///
-    /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
+    /// type Alloc = NonPagedAlloc;
     ///
     /// let layout = Layout::from_size_align(16, 64).unwrap();
     /// let ptr = Alloc::allocate_aligned(layout);
@@ -751,9 +758,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// # Examples
     /// ```no_run
-    /// use ntalloc::{NonPagedAlloc, DEFAULT_MEMORY_TAG};
+    /// use ntalloc::NonPagedAlloc;
     ///
-    /// type Alloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true>;
+    /// type Alloc = NonPagedAlloc;
     ///
     /// let ptr = Alloc::allocate(64);
     /// assert!(!ptr.is_null());
