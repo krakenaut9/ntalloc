@@ -139,6 +139,55 @@ struct ReadmeDoctests;
 /// `from_be_bytes`.
 pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 
+/// `"BIG "`, a tag the kernel reserves. Microsoft lists allocating with it as
+/// bug check `BAD_POOL_CALLER` (`0x9C`): such memory would be untrackable, and
+/// could corrupt the pool's tag tables.
+const BIG_POOL_TAG: u32 = u32::from_ne_bytes(*b"BIG ");
+
+/// The lowest byte `ExAllocatePool2` allows in a pool tag character: `0x20`,
+/// a space.
+const MIN_TAG_CHAR: u8 = 0x20;
+
+/// The highest byte `ExAllocatePool2` allows in a pool tag character: `0x7E`,
+/// a tilde.
+const MAX_TAG_CHAR: u8 = 0x7E;
+
+/// Whether `tag` is one to four printable ASCII characters, each from
+/// [`MIN_TAG_CHAR`] to [`MAX_TAG_CHAR`], in the order the debugger shows them,
+/// followed only by zero bytes when it is shorter, as `ExAllocatePool2`'s
+/// documentation requires.
+const fn tag_is_well_formed(tag: u32) -> bool {
+    let bytes = tag.to_ne_bytes();
+    let mut padding = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == 0 {
+            padding = true;
+        } else if padding || !matches!(byte, MIN_TAG_CHAR..=MAX_TAG_CHAR) {
+            return false;
+        }
+        i += 1;
+    }
+    // A first byte of zero means no characters at all.
+    bytes[0] != 0
+}
+
+/// Whether any byte of `tag` is an ASCII letter or digit. Microsoft lists
+/// allocating with a tag that has neither as bug check `BAD_POOL_CALLER`
+/// (`0x9D`), since such tags make pool usage hard to track.
+const fn tag_has_letter_or_digit(tag: u32) -> bool {
+    let bytes = tag.to_ne_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// A stateless, `#![no_std]`-friendly Windows kernel pool allocator.
 ///
 /// `NtAlloc` is a zero-sized type: all of its behavior is selected entirely at
@@ -161,9 +210,10 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 ///   refused; see [below](#unsupported-configurations).
 /// - `MEMORY_TAG`: the 4-byte pool tag attached to every allocation, used by
 ///   tools such as `!poolused`/`!poolfind` to attribute pool memory back to
-///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`]. The WDK asks for one
-///   to four printable ASCII characters (`0x20` to `0x7E`); only a zero tag
-///   is refused.
+///   this allocator. Defaults to [`DEFAULT_MEMORY_TAG`]. It must be one to
+///   four printable ASCII characters (`0x20` to `0x7E`), padded with zero
+///   bytes at the end when shorter, with at least one letter or digit; see
+///   [below](#unsupported-configurations).
 /// - `TAGGED_DEALLOC`: selects the free routine used by [`NtAlloc::deallocate`]:
 ///   `true` uses `ExFreePoolWithTag` (the tag must match the one the memory
 ///   was allocated with), `false` uses the untagged `ExFreePool`. Defaults to
@@ -188,16 +238,25 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 ///
 /// # Unsupported configurations
 ///
-/// These configurations would either fail every allocation or fail in a way
-/// Rust cannot handle, so a type that uses one fails to build as soon as
-/// anything allocates with it. The error comes from `cargo build`;
-/// `cargo check` does not evaluate it.
+/// These configurations break `ExAllocatePool2`'s documented rules, fail every
+/// allocation, are listed by Microsoft as bug checks, or fail in a way Rust
+/// cannot handle, so a type that uses one fails to build as soon as anything
+/// allocates with it. The error comes from `cargo build`; `cargo check` does
+/// not evaluate it.
 ///
 /// - `POOL_FLAG_RAISE_ON_FAILURE` (`0x20`) makes `ExAllocatePool2` raise an
 ///   SEH exception on failure instead of returning null. Rust cannot catch
 ///   SEH: left unhandled the exception bugchecks the system, and handled
 ///   further up it unwinds through Rust frames, which is undefined behaviour.
 /// - A zero `MEMORY_TAG`, which `ExAllocatePool2` rejects as invalid.
+/// - A `MEMORY_TAG` that is not one to four printable ASCII characters
+///   (`0x20` to `0x7E`) followed only by zero padding, as `ExAllocatePool2`'s
+///   documentation requires: one with a control byte, a byte above `0x7E`, or
+///   a zero byte before its last character.
+/// - A `MEMORY_TAG` with no ASCII letter or digit, such as four spaces, which
+///   Microsoft lists as bug check `BAD_POOL_CALLER` (`0x9D`).
+/// - `"BIG "`, a tag the kernel reserves, which Microsoft lists as bug check
+///   `BAD_POOL_CALLER` (`0x9C`).
 ///
 /// Without `POOL_FLAG_RAISE_ON_FAILURE`, failure is reported as null.
 /// Fallible APIs such as `Box::try_new_in` return it as an error, and
@@ -205,9 +264,8 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// in a `#![no_std]` build panics by default: the fail-fast behaviour the flag
 /// would otherwise give.
 ///
-/// This is not a full validation of the parameters: any other combination
-/// the pool considers invalid fails at run time, like any other allocation
-/// failure.
+/// The flags are not validated beyond that: any other combination the pool
+/// considers invalid fails at run time, like any other allocation failure.
 ///
 /// ```compile_fail,E0080
 /// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
@@ -224,6 +282,31 @@ pub const DEFAULT_MEMORY_TAG: u32 = u32::from_ne_bytes(*b"Rust");
 /// type Untagged = NtAlloc<POOL_FLAG_NON_PAGED, 0>;
 ///
 /// let _ = Untagged::allocate(64);
+/// ```
+///
+/// ```compile_fail,E0080
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
+///
+/// // A zero byte before the last character.
+/// type Gapped = NtAlloc<POOL_FLAG_NON_PAGED, { u32::from_ne_bytes(*b"ab\0c") }>;
+///
+/// let _ = Gapped::allocate(64);
+/// ```
+///
+/// ```compile_fail,E0080
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
+///
+/// type Blank = NtAlloc<POOL_FLAG_NON_PAGED, { u32::from_ne_bytes(*b"    ") }>;
+///
+/// let _ = Blank::allocate(64);
+/// ```
+///
+/// ```compile_fail,E0080
+/// use ntalloc::{NtAlloc, POOL_FLAG_NON_PAGED};
+///
+/// type Big = NtAlloc<POOL_FLAG_NON_PAGED, { u32::from_ne_bytes(*b"BIG ") }>;
+///
+/// let _ = Big::allocate(64);
 /// ```
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NtAlloc<
@@ -277,7 +360,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 
     /// Fails the build for a configuration [`NtAlloc`] refuses: one whose
     /// `ALLOC_POOL_FLAGS` include `POOL_FLAG_RAISE_ON_FAILURE`, or whose
-    /// `MEMORY_TAG` is zero.
+    /// `MEMORY_TAG` is zero, is not one to four printable ASCII characters,
+    /// has no letter or digit, or is `"BIG "`.
     ///
     /// With `POOL_FLAG_RAISE_ON_FAILURE`, `ExAllocatePool2` raises an SEH
     /// exception on failure instead of returning null. Unhandled, the
@@ -285,7 +369,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// Rust frames that call `ExAllocatePool2` through a non-unwinding ABI,
     /// which is undefined behaviour. Either way the null that [`GlobalAlloc`]
     /// and [`Allocator`] report failure with never arrives. A zero tag fails
-    /// every allocation, since `ExAllocatePool2` rejects it as invalid.
+    /// every allocation, since `ExAllocatePool2` rejects it as invalid. The
+    /// other tags break the format `ExAllocatePool2` documents, or are ones
+    /// Microsoft lists as bug check `BAD_POOL_CALLER`.
     ///
     /// [`Allocator`]: core::alloc::Allocator
     ///
@@ -303,6 +389,21 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             MEMORY_TAG != 0,
             "MEMORY_TAG is zero: ExAllocatePool2 fails every allocation with a \
              zero tag"
+        );
+        assert!(
+            tag_is_well_formed(MEMORY_TAG),
+            "MEMORY_TAG is not one to four printable ASCII characters (0x20 to \
+             0x7E) followed only by zero padding, as ExAllocatePool2 requires"
+        );
+        assert!(
+            tag_has_letter_or_digit(MEMORY_TAG),
+            "MEMORY_TAG has no ASCII letter or digit (bug check \
+             BAD_POOL_CALLER, 0x9D)"
+        );
+        assert!(
+            MEMORY_TAG != BIG_POOL_TAG,
+            "MEMORY_TAG is \"BIG \", a tag the kernel reserves (bug check \
+             BAD_POOL_CALLER, 0x9C)"
         );
     };
 

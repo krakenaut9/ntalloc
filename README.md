@@ -18,8 +18,8 @@ collection can use a pool of its own.
   pool tag, and whether freeing checks the tag
 - Any alignment a `Layout` asks for, including `#[repr(align(64))]` types and
   alignments larger than a page
-- `POOL_FLAG_RAISE_ON_FAILURE` and a zero tag are refused when the driver is
-  built, not discovered when it runs
+- `POOL_FLAG_RAISE_ON_FAILURE` and invalid pool tags are refused when the
+  driver is built, not discovered when it runs
 - Testable in user mode with the `usermode-backend` feature, and checked under
   Miri
 
@@ -108,7 +108,9 @@ assert!(!ScratchAlloc::POOL_ZEROES);
 
 - `MEMORY_TAG` defaults to `DEFAULT_MEMORY_TAG`, which the debugger shows as
   `Rust`. Build your own with `u32::from_ne_bytes`, as above, and it appears
-  exactly as written.
+  exactly as written. A tag is one to four printable ASCII characters, padded
+  with zero bytes at the end when shorter, and needs at least one letter or
+  digit.
 - `TAGGED_DEALLOC`, `true` by default, frees with `ExFreePoolWithTag`, which
   checks the tag; `false` frees with `ExFreePool`.
 - `ExAllocatePool2` zeroes every block unless `POOL_FLAG_UNINITIALIZED` is set,
@@ -119,10 +121,11 @@ assert!(!ScratchAlloc::POOL_ZEROES);
   `POOL_FLAG_NON_PAGED`, `POOL_FLAG_UNINITIALIZED`, `POOL_FLAG_CACHE_ALIGNED`,
   `POOL_FLAG_USE_QUOTA` and `POOL_FLAG_SPECIAL_POOL`. Other flags from `wdm.h`
   can be passed as raw values, with the one exception below.
-- Two configurations fail the build. `POOL_FLAG_RAISE_ON_FAILURE` would make a
-  failed allocation raise an SEH exception, which Rust cannot handle, and a zero
-  tag makes every allocation fail. The error, E0080, comes from `cargo build`;
-  `cargo check` does not report it.
+- Some configurations fail the build: `POOL_FLAG_RAISE_ON_FAILURE`, which
+  would make a failed allocation raise an SEH exception Rust cannot handle; a
+  zero tag, which makes every allocation fail; any other tag that breaks the
+  rules above; and `"BIG "`, a tag the kernel reserves. The error, E0080, comes
+  from `cargo build`; `cargo check` does not report it.
 
 ## Alignment
 

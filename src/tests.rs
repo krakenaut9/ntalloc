@@ -628,6 +628,83 @@ fn zero_size_meets_the_zeroing_paths() {
     }
 }
 
+/// The tag rules accept what `ExAllocatePool2` documents as valid, including
+/// shorter tags padded with zero bytes, and refuse the rest for the right
+/// reason.
+#[test]
+fn tag_rules_follow_the_documented_format() {
+    let valid = [
+        *b"Rust",
+        *b"MyDr",
+        *b"1234",
+        *b"ab\0\0",
+        *b"A\0\0\0",
+        *b"a b ",
+        *b"~ok~",
+        // Its only digit is the last character, which the letter-or-digit
+        // check must still reach.
+        *b"---1",
+        *b"BIG\0",
+    ];
+    for bytes in valid {
+        let tag = u32::from_ne_bytes(bytes);
+        assert!(tag_is_well_formed(tag), "{bytes:?} should be well-formed");
+        assert!(
+            tag_has_letter_or_digit(tag),
+            "{bytes:?} should have a letter or digit"
+        );
+        assert_ne!(
+            tag, BIG_POOL_TAG,
+            "{bytes:?} should not be the reserved tag"
+        );
+    }
+
+    // Not one to four printable characters followed only by zero padding.
+    let malformed = [
+        *b"\0abc",
+        *b"a\0bc",
+        *b"ab\0c",
+        *b"\0\0\0a",
+        // Just outside the documented range at each end, written out so the
+        // test pins the range rather than following MIN_TAG_CHAR/MAX_TAG_CHAR.
+        [0x1F, b'a', b'b', b'c'],
+        [b'a', 0x7F, b'b', b'c'],
+        [b'R', b'u', b's', 0x80],
+        [0xFF; 4],
+        [0; 4],
+    ];
+    for bytes in malformed {
+        assert!(
+            !tag_is_well_formed(u32::from_ne_bytes(bytes)),
+            "{bytes:?} should not be well-formed"
+        );
+    }
+
+    // Well-formed, but with no letter or digit.
+    for bytes in [*b"    ", *b"!!!!", *b"-~-~", *b" \0\0\0"] {
+        let tag = u32::from_ne_bytes(bytes);
+        assert!(tag_is_well_formed(tag), "{bytes:?} should be well-formed");
+        assert!(
+            !tag_has_letter_or_digit(tag),
+            "{bytes:?} should have no letter or digit"
+        );
+    }
+
+    assert_eq!(BIG_POOL_TAG.to_ne_bytes(), *b"BIG ");
+}
+
+/// A tag shorter than four characters, padded with zero bytes, passes the
+/// build-time checks and allocates.
+#[test]
+fn a_zero_padded_tag_allocates() {
+    type Short = NtAlloc<POOL_FLAG_NON_PAGED, { u32::from_ne_bytes(*b"ab\0\0") }>;
+
+    let ptr = Short::allocate(64);
+    assert!(!ptr.is_null());
+    // SAFETY: from Short::allocate, never realigned, freed once.
+    unsafe { Short::deallocate(ptr) };
+}
+
 /// Both marker traits have empty bodies, so nothing else in the suite
 /// notices if an impl is removed or gated wrongly. These bounds are
 /// checked at compile time; the call sites exist only to instantiate them.
