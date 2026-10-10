@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main, implementation]
+  pull_request:
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A new push to a branch makes the run in progress obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Every cargo job runs on Windows: windows-sys links real import libraries and
+  # the doctests build executables, so the tests cannot run on another platform.
+  test:
+    name: test ${{ matrix.toolchain }} / ${{ matrix.features || 'no features' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { toolchain: stable,  features: "",                                    expect: pass }
+          - { toolchain: stable,  features: "usermode-backend",                    expect: pass }
+          # The Allocator API needs unstable language features, so it must NOT
+          # build on stable. Asserting the failure is what pins that contract.
+          - { toolchain: stable,  features: "allocator-api",                       expect: "E0554" }
+          # The marker traits do not exist on stable either.
+          - { toolchain: stable,  features: "allocator-api-markers",               expect: "E0554 E0432" }
+          - { toolchain: nightly, features: "",                                    expect: pass }
+          - { toolchain: nightly, features: "allocator-api",                       expect: pass }
+          - { toolchain: nightly, features: "allocator-api,allocator-api-markers", expect: pass }
+          - { toolchain: nightly, features: "allocator-api,allocator-api-markers,usermode-backend", expect: pass }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      # One cache per row, so rows with different features do not overwrite
+      # each other's.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: cargo test
+        shell: bash
+        run: |
+          feat=""
+          if [ -n "${{ matrix.features }}" ]; then
+            feat="--features ${{ matrix.features }}"
+          fi
+
+          set +e
+          cargo test --locked $feat 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${{ matrix.expect }}" = "pass" ]; then
+            if [ $code -ne 0 ]; then
+              echo "::error::expected this combination to build, but it failed"
+              exit 1
+            fi
+          else
+            if [ $code -eq 0 ]; then
+              echo "::error::expected this combination to be rejected on stable, but it built"
+              exit 1
+            fi
+            # Assert the *reason*, so an unrelated breakage cannot masquerade
+            # as the expected rejection and turn this job green.
+            for want in ${{ matrix.expect }}; do
+              if ! grep -q "error\[$want\]" build.log; then
+                echo "::error::build failed, but not with $want"
+                exit 1
+              fi
+            done
+          fi
+
+  msrv:
+    name: msrv 1.85
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      # The Allocator API features are excluded: they need nightly, not a
+      # newer stable.
+      - run: cargo test --locked
+      - run: cargo test --locked --features usermode-backend
+      - run: cargo check --locked --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+  lint:
+    name: clippy + rustfmt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # The lint levels come from [lints.clippy] in Cargo.toml; -D warnings
+      # escalates them to errors here.
+      - run: cargo +nightly clippy --locked --all-targets --no-deps -- -D warnings
+      - run: cargo +nightly clippy --locked --all-targets --all-features --no-deps -- -D warnings
+      - run: cargo +stable clippy --locked --all-targets --no-deps -- -D warnings
+      # Windows on ARM drivers.
+      - run: cargo +nightly clippy --locked --all-targets --all-features --no-deps --target aarch64-pc-windows-msvc -- -D warnings
+      - run: cargo +nightly clippy --locked --all-features --no-deps -- -D clippy::cargo
+      - run: cargo +nightly fmt --all --check
+
+  docs:
+    name: rustdoc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: rustdoc (stable)
+        run: cargo +stable doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: rustdoc (nightly, all features)
+        run: cargo +nightly doc --locked --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Reproduces the docs.rs build from [package.metadata.docs.rs]: its
+      # feature list, its target, and --cfg docsrs.
+      - name: rustdoc (docs.rs configuration)
+        run: cargo +nightly doc --locked --no-deps --target x86_64-pc-windows-msvc --features allocator-api,allocator-api-markers
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+
+  package:
+    name: package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --locked --dry-run
+      # The package ships tests/, so run them from the .crate itself: they
+      # must pass without the repository around them. Relative paths only, so
+      # nothing depends on how bash spells the runner's Windows paths.
+      - name: test the packaged crate
+        shell: bash
+        run: |
+          cargo package --locked
+          mkdir -p ../pkg
+          tar -xzf target/package/ntalloc-*.crate -C ../pkg
+          cd ../pkg/ntalloc-*
+          cargo test --locked
+          cargo test --locked --features usermode-backend
+
+  miri:
+    name: miri
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # Miri builds its own standard library, from rust-src.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      # The usermode backend lets the alignment and stashing logic run under
+      # Miri; it covers the unit tests, tests/ and the doctests.
+      - run: cargo miri test --locked
+      - run: cargo miri test --locked --all-features
+
+  readme:
+    name: README API coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/readme_api_coverage.py
