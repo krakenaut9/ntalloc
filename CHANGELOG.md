@@ -9,6 +9,8 @@ While the version is below 1.0, a minor bump may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-10
+
 First public release.
 
 ### Added
@@ -54,4 +56,5 @@ First public release.
 - Requires Windows 10, version 2004 or later, where `ExAllocatePool2` exists,
   and `panic = "abort"` in the driver's own profiles.
 
-[Unreleased]: https://github.com/krakenaut9/ntalloc/commits/HEAD
+[Unreleased]: https://github.com/krakenaut9/ntalloc/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/krakenaut9/ntalloc/releases/tag/v0.1.0
