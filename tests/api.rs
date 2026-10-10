@@ -4,8 +4,10 @@
 // Without the feature `NtAlloc` would call the real kernel pool, which a
 // test process cannot do.
 #![cfg(feature = "usermode-backend")]
-#![cfg_attr(feature = "allocator-api", feature(allocator_api))]
-#![cfg_attr(feature = "allocator-api-markers", feature(btreemap_alloc))]
+#![cfg_attr(
+    feature = "allocator-api-markers",
+    feature(allocator_ext, btreemap_alloc)
+)]
 
 use core::alloc::{GlobalAlloc, Layout};
 use ntalloc::{DEFAULT_MEMORY_TAG, PagedAlloc};

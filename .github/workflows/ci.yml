@@ -29,11 +29,15 @@ jobs:
         include:
           - { toolchain: stable,  features: "",                                    expect: pass }
           - { toolchain: stable,  features: "usermode-backend",                    expect: pass }
-          # The Allocator API needs unstable language features, so it must NOT
-          # build on stable. Asserting the failure is what pins that contract.
-          - { toolchain: stable,  features: "allocator-api",                       expect: "E0554" }
-          # The marker traits do not exist on stable either.
-          - { toolchain: stable,  features: "allocator-api-markers",               expect: "E0554 E0432" }
+          # The Allocator trait is stable from Rust 1.100: before that this must
+          # fail as an unstable library feature (E0658), from then on it must
+          # build. The step reads which applies from the compiler's version.
+          - { toolchain: stable,  features: "allocator-api",                       expect: "since-1.100" }
+          # The marker traits are still unstable, so stable must reject them.
+          - { toolchain: stable,  features: "allocator-api-markers",               expect: "E0554" }
+          # A stable-channel compiler that already has the trait, until 1.100
+          # itself is the stable release.
+          - { toolchain: beta,    features: "allocator-api,usermode-backend",      expect: pass }
           - { toolchain: nightly, features: "",                                    expect: pass }
           - { toolchain: nightly, features: "allocator-api",                       expect: pass }
           - { toolchain: nightly, features: "allocator-api,allocator-api-markers", expect: pass }
@@ -56,30 +60,42 @@ jobs:
             feat="--features ${{ matrix.features }}"
           fi
 
+          expect="${{ matrix.expect }}"
+          if [ "$expect" = "since-1.100" ]; then
+            minor=$(rustc -V | cut -d' ' -f2 | cut -d. -f2)
+            if [ "$minor" -ge 100 ]; then expect=pass; else expect=E0658; fi
+            echo "rustc 1.$minor: expecting $expect"
+          fi
+
           set +e
           cargo test --locked $feat 2>&1 | tee build.log
           code=${PIPESTATUS[0]}
           set -e
 
-          if [ "${{ matrix.expect }}" = "pass" ]; then
+          if [ "$expect" = "pass" ]; then
             if [ $code -ne 0 ]; then
               echo "::error::expected this combination to build, but it failed"
               exit 1
             fi
           else
             if [ $code -eq 0 ]; then
-              echo "::error::expected this combination to be rejected on stable, but it built"
+              echo "::error::expected this combination to be rejected, but it built"
               exit 1
             fi
             # Assert the *reason*, so an unrelated breakage cannot masquerade
             # as the expected rejection and turn this job green.
-            for want in ${{ matrix.expect }}; do
+            for want in $expect; do
               if ! grep -q "error\[$want\]" build.log; then
                 echo "::error::build failed, but not with $want"
                 exit 1
               fi
             done
           fi
+      # The README's Allocator example is marked ignore, since the doctests also
+      # run on compilers without the trait; run it where the trait exists.
+      - name: README Allocator example
+        if: matrix.toolchain == 'beta'
+        run: cargo test --locked --doc --features allocator-api,usermode-backend -- --include-ignored
 
   msrv:
     name: msrv 1.85

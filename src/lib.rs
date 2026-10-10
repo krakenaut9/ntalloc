@@ -2,10 +2,11 @@
 //!
 //! `ntalloc` wraps the WDK pool APIs (`ExAllocatePool2`, `ExFreePool`,
 //! `ExFreePoolWithTag`) behind the standard [`GlobalAlloc`] trait and, with
-//! the `allocator-api` feature, the unstable [`Allocator`] trait, so ordinary
+//! the `allocator-api` feature, the [`Allocator`] trait, so ordinary
 //! `alloc`-crate types (`Vec`, `Box`, ...) can be backed by kernel pool
 //! memory from a `#![no_std]` driver. It builds on stable Rust 1.85 or
-//! newer; only `allocator-api` and `allocator-api-markers` need nightly.
+//! newer; `allocator-api` needs Rust 1.100, and `allocator-api-markers` a
+//! nightly compiler.
 //!
 //! [`Allocator`]: core::alloc::Allocator
 //!
@@ -56,16 +57,16 @@
 //!
 //! # Features
 //!
-//! - **`allocator-api`** — implements the unstable `Allocator` trait for
+//! - **`allocator-api`** — implements the `Allocator` trait for
 //!   [`NtAlloc`], so a collection can use it directly, as in `Vec::new_in`
-//!   and `Box::new_in`, not only as the `#[global_allocator]`. It needs a
-//!   nightly compiler, as does any code that uses the trait.
+//!   and `Box::new_in`, not only as the `#[global_allocator]`. It needs Rust
+//!   1.100 or newer, where the trait is stable.
 //! - **`allocator-api-markers`** — implements the `StaticAllocator` and
 //!   `AllocatorClone` marker traits for [`NtAlloc`]. `alloc` requires them in
 //!   places: `Box::pin_in` needs `StaticAllocator`, and cloning an `Arc` or
 //!   `Rc`, or using a `BTreeMap` at all, needs `AllocatorClone`. It implies
-//!   `allocator-api`. Off by default, because on a nightly that predates
-//!   these traits, enabling it fails to compile.
+//!   `allocator-api`. The marker traits are still unstable (`allocator_ext`),
+//!   so it needs a nightly compiler from October 2026 or later.
 //! - **`usermode-backend`** — for tests only. Allocates from the process heap
 //!   (`std::alloc::System`) instead of the kernel pool, so code that allocates
 //!   through [`NtAlloc`] can run in tests on a normal machine. Where the pool
@@ -87,7 +88,7 @@
 //!   ```
 
 #![no_std]
-#![cfg_attr(feature = "allocator-api", feature(allocator_api))]
+#![cfg_attr(feature = "allocator-api-markers", feature(allocator_ext))]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 // Doctests are this crate's documentation, so let them fail on unused imports
@@ -123,8 +124,8 @@ use windows_sys::Wdk::System::SystemServices::{
     ExAllocatePool2, ExFreePool, ExFreePoolWithTag, PAGE_SIZE,
 };
 
-// The README's examples are compiled as doctests, all but the nightly-only one,
-// which is marked ignore.
+// The README's examples are compiled as doctests, all but the `Allocator` one,
+// which needs Rust 1.100 and the allocator-api feature and is marked ignore.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
@@ -765,6 +766,7 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///   zero-size request to a null pointer. The [`Allocator::allocate`]
     ///   implementation documents that case in full.
     #[cfg(feature = "allocator-api")]
+    #[clippy::msrv = "1.100"]
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
             // Allocator, unlike GlobalAlloc, requires zero-sized allocations
@@ -1036,6 +1038,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // - a zero-size request gets a dangling, aligned pointer, which `deallocate`
 //   recognizes and never frees.
 #[cfg(feature = "allocator-api")]
+#[clippy::msrv = "1.100"]
 unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
     Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
 {

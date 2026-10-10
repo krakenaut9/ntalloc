@@ -37,9 +37,10 @@ First public release.
   whose SEH exception Rust cannot handle, and a pool tag that is zero, is not
   one to four printable ASCII characters, has no letter or digit, or is
   `"BIG "`.
-- The `allocator-api` feature (nightly): an `Allocator` implementation, so
-  collections can use the allocator directly with `Vec::new_in` or
-  `Box::new_in`. Zero-sized requests succeed without reaching the pool.
+- The `allocator-api` feature (Rust 1.100 or newer): an `Allocator`
+  implementation, so collections can use the allocator directly with
+  `Vec::new_in` or `Box::new_in`. Zero-sized requests succeed without
+  reaching the pool.
 - The `allocator-api-markers` feature (nightly): the `StaticAllocator` and
   `AllocatorClone` marker traits.
 - The `usermode-backend` feature, for tests: allocations come from the process
@@ -47,8 +48,9 @@ First public release.
 
 ### Notes
 
-- `#![no_std]` with no default features. Everything but the two `allocator-api`
-  features builds on stable; the minimum supported Rust version is 1.85.
+- `#![no_std]` with no default features. The minimum supported Rust version is
+  1.85; `allocator-api` needs 1.100, and `allocator-api-markers` a nightly
+  compiler.
 - Requires Windows 10, version 2004 or later, where `ExAllocatePool2` exists,
   and `panic = "abort"` in the driver's own profiles.
 

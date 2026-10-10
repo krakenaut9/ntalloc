@@ -7,13 +7,14 @@
 
 A `#[global_allocator]` for Windows kernel drivers written in `#![no_std]` Rust.
 `ntalloc` serves the `alloc` crate (`Vec`, `Box`, `String` and the rest) from the
-kernel pool through `ExAllocatePool2`, on stable Rust. With the nightly-only
-`allocator-api` feature it also implements the `Allocator` trait, so a single
-collection can use a pool of its own.
+kernel pool through `ExAllocatePool2`, on stable Rust. With the `allocator-api`
+feature (Rust 1.100 or newer) it also implements the `Allocator` trait, so a
+single collection can use a pool of its own.
 
 ## Highlights
 
-- Builds on **stable** Rust 1.85; nightly only for the opt-in `Allocator` API
+- Builds on **stable** Rust 1.85; the opt-in `Allocator` API needs 1.100, and
+  only its marker traits need nightly
 - One zero-sized type, configured entirely at compile time: the pool flags, the
   pool tag, and whether freeing checks the tag
 - Any alignment a `Layout` asks for, including `#[repr(align(64))]` types and
@@ -159,14 +160,12 @@ unsafe { Alloc::deallocate_aligned(ptr, layout) };
 `kernel_allocate` is `allocate` without the test backend: it always reaches the
 pool, with or without `usermode-backend`.
 
-## The `Allocator` API (nightly)
+## The `Allocator` API (Rust 1.100)
 
 With the `allocator-api` feature, `NtAlloc` implements `core::alloc::Allocator`,
 so one collection can use a different pool or tag from the global allocator:
 
 ```rust,ignore
-#![feature(allocator_api)]
-
 use ntalloc::PagedAlloc;
 
 // A paged-pool buffer, for code that runs at PASSIVE_LEVEL.
@@ -176,7 +175,8 @@ name.extend("rule".encode_utf16());
 
 `allocator-api-markers` adds the `StaticAllocator` and `AllocatorClone` marker
 traits, which `Box::pin_in`, cloning an `Arc` or `Rc`, and `BTreeMap` require.
-It needs a nightly recent enough to define them.
+They are still unstable, so it needs a nightly compiler from October 2026 or
+later.
 
 ## Testing in user mode
 
@@ -202,8 +202,8 @@ duplicate `panic_impl` lang item.
 
 | Feature                 | Toolchain      | Adds                                                                 |
 | ----------------------- | -------------- | -------------------------------------------------------------------- |
-| `allocator-api`         | nightly        | the `Allocator` impl                                                 |
-| `allocator-api-markers` | recent nightly | `StaticAllocator` and `AllocatorClone`; implies `allocator-api`      |
+| `allocator-api`         | Rust 1.100     | the `Allocator` impl                                                 |
+| `allocator-api-markers` | nightly        | `StaticAllocator` and `AllocatorClone`; implies `allocator-api`      |
 | `usermode-backend`      | stable         | the process-heap backend, for `[dev-dependencies]` only              |
 
 There are no default features.
@@ -228,9 +228,9 @@ The full reference is on [docs.rs](https://docs.rs/ntalloc).
 
 ## Minimum supported Rust version
 
-**1.85**, set by the 2024 edition. The `allocator-api` and
-`allocator-api-markers` features additionally require a nightly compiler;
-everything else builds on stable.
+**1.85**, set by the 2024 edition. The `allocator-api` feature requires Rust
+1.100, where the `Allocator` trait became stable, and `allocator-api-markers` a
+nightly compiler; everything else builds on 1.85.
 
 The MSRV is treated as a compatibility promise: raising it is a breaking change
 and will come with a minor version bump before 1.0.

@@ -22,12 +22,12 @@ allocator-api2 = { version = "0.2.21", optional = true, default-features = false
 hashbrown = { version = "0.17", optional = true, default-features = false, features = ["allocator-api2"] }
 
 [features]
-# Implements the unstable Allocator trait, so collections can use NtAlloc
-# directly (Vec::new_in, Box::new_in). Needs a nightly compiler; without it
-# the crate builds on stable.
+# Implements the Allocator trait, so collections can use NtAlloc directly
+# (Vec::new_in, Box::new_in). Needs Rust 1.100, where the trait is stable;
+# without it the crate builds on 1.85.
 allocator-api = []
-# Implements the StaticAllocator and AllocatorClone marker traits. Nightlies
-# that predate them fail to compile with this on, so it is opt-in.
+# Implements the StaticAllocator and AllocatorClone marker traits, which are
+# still unstable (allocator_ext): needs a nightly from October 2026 or later.
 allocator-api-markers = ["allocator-api"]
 # For tests only: allocates from the process heap instead of the kernel pool,
 # so code using NtAlloc can run on a normal machine. Enable it only under
