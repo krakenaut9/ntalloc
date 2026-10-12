@@ -9,7 +9,7 @@ While the version is below 1.0, a minor bump may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-10
+## [0.1.0] - 2026-10-12
 
 First public release.
 
