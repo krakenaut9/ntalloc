@@ -186,6 +186,138 @@ fn allocate_aligned_test_alignment_greater_than_page_size() {
     unsafe { PagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(aligned_ptr, layout) };
 }
 
+/// A configuration with `REALIGN` off: the non-paged pool, the default tag and
+/// tagged free.
+type NoRealign = NtAlloc<POOL_FLAG_NON_PAGED, DEFAULT_MEMORY_TAG, true, false>;
+
+/// Layouts aligned more strictly than the pool guarantees for their size: a
+/// default configuration realigns them, one with `REALIGN` off ignores their
+/// alignment.
+fn layouts_needing_realignment() -> [Layout; 4] {
+    let page = PAGE_SIZE as usize;
+    [
+        Layout::from_size_align(16, 32).unwrap(),
+        Layout::from_size_align(64, 64).unwrap(),
+        Layout::from_size_align(100, page).unwrap(),
+        Layout::from_size_align(page * 2, page * 2).unwrap(),
+    ]
+}
+
+/// Layouts the pool aligns by itself, which every configuration serves alike.
+fn layouts_the_pool_aligns() -> [Layout; 4] {
+    let page = PAGE_SIZE as usize;
+    [
+        Layout::from_size_align(64, 8).unwrap(),
+        Layout::from_size_align(64, MIN_ALIGNMENT).unwrap(),
+        Layout::from_size_align(page, page).unwrap(),
+        Layout::from_size_align(page * 2, page).unwrap(),
+    ]
+}
+
+#[test]
+fn realign_off_ignores_the_alignment_asked_for() {
+    let alloc = NoRealign::default();
+    for layout in layouts_needing_realignment() {
+        assert!(
+            !NoRealign::is_kernel_aligned(layout),
+            "{layout:?} should need realignment"
+        );
+        let pool_alignment = NoRealign::kernel_alignment(layout.size());
+
+        // Served by size alone: the pool's own pointer at the pool's own
+        // alignment, with nothing stashed in front of it, so the plain free
+        // takes it back (the heap backend aborts on any pointer it did not
+        // hand out itself).
+        let ptr = NoRealign::allocate_aligned(layout);
+        assert!(!ptr.is_null(), "{layout:?}");
+        assert_eq!(ptr.addr() % pool_alignment, 0, "{layout:?}");
+        // SAFETY: the pool's own pointer, never realigned, freed once.
+        unsafe { NoRealign::deallocate(ptr) };
+
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { alloc.alloc(layout) };
+        assert!(!ptr.is_null(), "{layout:?}");
+        // SAFETY: from alloc with this exact layout, freed once.
+        unsafe { alloc.dealloc(ptr, layout) };
+
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { alloc.alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "{layout:?}");
+        // SAFETY: alloc_zeroed returned `layout.size()` initialized bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
+        assert!(bytes.iter().all(|&b| b == 0), "{layout:?}");
+        // SAFETY: from alloc_zeroed with this exact layout, freed once.
+        unsafe { alloc.dealloc(ptr, layout) };
+    }
+}
+
+#[test]
+fn realign_off_hands_out_only_the_pools_own_pointers() {
+    let strict = NoRealign::default();
+    for layout in layouts_the_pool_aligns() {
+        let ptr = NoRealign::allocate_aligned(layout);
+        assert!(!ptr.is_null(), "{layout:?}");
+        assert_eq!(ptr.addr() % layout.align(), 0, "{layout:?}");
+        // Nothing was stashed in front of it: the plain free, which knows
+        // nothing about realignment, takes it back, and the heap backend
+        // aborts on any pointer it did not hand out itself.
+        // SAFETY: the pool's own pointer, never realigned, freed once.
+        unsafe { NoRealign::deallocate(ptr) };
+
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { strict.alloc(layout) };
+        assert!(!ptr.is_null(), "{layout:?}");
+        // SAFETY: from alloc with this exact layout, freed once.
+        unsafe { strict.dealloc(ptr, layout) };
+    }
+}
+
+#[test]
+fn realign_off_resizes_without_realigning() {
+    // realloc keeps the alignment, and a page-aligned page shrunk below a page
+    // asks for an alignment the pool gives only blocks of a page or more. With
+    // REALIGN off it is served at the pool's own alignment all the same, and
+    // the contents move with it.
+    let alloc = NoRealign::default();
+    let page = PAGE_SIZE as usize;
+    let layout = Layout::from_size_align(page, page).unwrap();
+    // SAFETY: the layout has a non-zero size.
+    let ptr = unsafe { alloc.alloc(layout) };
+    assert!(!ptr.is_null());
+    // SAFETY: `ptr` holds `page` writable bytes.
+    unsafe { ptr.write_bytes(0x7E, page) };
+
+    // SAFETY: `ptr` came from alloc with `layout`, and 100 is a valid size for
+    // its alignment.
+    let shrunk = unsafe { alloc.realloc(ptr, layout, 100) };
+    assert!(!shrunk.is_null());
+    assert_eq!(shrunk.addr() % NoRealign::kernel_alignment(100), 0);
+    // SAFETY: realloc returned 100 bytes holding the first 100 of the old block.
+    let bytes = unsafe { core::slice::from_raw_parts(shrunk, 100) };
+    assert!(bytes.iter().all(|&b| b == 0x7E));
+    let shrunk_layout = Layout::from_size_align(100, page).unwrap();
+    // SAFETY: the block realloc returned for `shrunk_layout`, freed once.
+    unsafe { alloc.dealloc(shrunk, shrunk_layout) };
+}
+
+#[test]
+fn realign_is_on_by_default_and_the_aliases_pass_it_through() {
+    // The default configuration still realigns.
+    let layout = Layout::from_size_align(64, 64).unwrap();
+    let ptr = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::allocate_aligned(layout);
+    assert!(!ptr.is_null());
+    // SAFETY: from allocate_aligned with this exact layout, freed once.
+    unsafe { NonPagedAlloc::<DEFAULT_MEMORY_TAG, true>::deallocate_aligned(ptr, layout) };
+
+    // The aliases' new parameter lands in the same place as NtAlloc's, and
+    // leaving it out means `true`.
+    let _: NoRealign = NonPagedAlloc::<DEFAULT_MEMORY_TAG, true, false>::default();
+    let _: NtAlloc<POOL_FLAG_PAGED, DEFAULT_MEMORY_TAG, true, false> =
+        PagedAlloc::<DEFAULT_MEMORY_TAG, true, false>::default();
+    let _: NtAlloc<POOL_FLAG_NON_PAGED> =
+        NonPagedAlloc::<DEFAULT_MEMORY_TAG, true, true>::default();
+}
+
 #[test]
 fn align_up_to_advances_from_an_already_aligned_base() {
     // The case the stash scheme actually depends on. Returning an
@@ -277,6 +409,39 @@ fn allocator_accepts_zero_sized_layouts() {
             );
         }
     }
+}
+
+#[cfg(feature = "allocator-api")]
+#[test]
+fn realign_off_serves_through_the_allocator_api() {
+    let alloc = NoRealign::default();
+    for layout in layouts_needing_realignment()
+        .into_iter()
+        .chain(layouts_the_pool_aligns())
+    {
+        let block = alloc.allocate(layout).unwrap();
+        assert_eq!(block.len(), layout.size());
+        let ptr = block.cast::<u8>().as_ptr();
+        assert_eq!(ptr.addr() % NoRealign::kernel_alignment(layout.size()), 0);
+        // SAFETY: from allocate with this exact layout.
+        unsafe { alloc.deallocate(block.cast(), layout) };
+
+        let block = alloc.allocate_zeroed(layout).unwrap();
+        // SAFETY: allocate_zeroed returned `layout.size()` initialized bytes.
+        let bytes = unsafe { block.as_ref() };
+        assert!(bytes.iter().all(|&b| b == 0));
+        // SAFETY: from allocate_zeroed with this exact layout.
+        unsafe { alloc.deallocate(block.cast(), layout) };
+    }
+
+    // A zero-size request never reaches the pool, and its dangling pointer
+    // honours the alignment asked for even here.
+    let empty = Layout::from_size_align(0, 64).unwrap();
+    let block = alloc.allocate(empty).unwrap();
+    assert_eq!(block.len(), 0);
+    assert_eq!(block.cast::<u8>().as_ptr().addr() % 64, 0);
+    // SAFETY: from allocate with this exact layout.
+    unsafe { alloc.deallocate(block.cast(), empty) };
 }
 
 #[cfg(feature = "allocator-api")]

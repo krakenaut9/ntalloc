@@ -91,8 +91,8 @@ fallible APIs first.
 ## Tags and flags
 
 Both aliases are shorthand for
-`NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>`, which takes any
-combination of pool flags:
+`NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>`, which takes
+any combination of pool flags:
 
 ```rust
 use ntalloc::{NonPagedAlloc, NtAlloc, POOL_FLAG_NON_PAGED, POOL_FLAG_UNINITIALIZED};
@@ -114,6 +114,10 @@ assert!(!ScratchAlloc::POOL_ZEROES);
   digit.
 - `TAGGED_DEALLOC`, `true` by default, frees with `ExFreePoolWithTag`, which
   checks the tag; `false` frees with `ExFreePool`.
+- `REALIGN`, `true` by default, serves a `Layout` aligned more strictly than the
+  pool guarantees by over-allocating and realigning, as described under
+  [Alignment](#alignment); `false` turns that off, for drivers that never need
+  more than the pool's own alignment.
 - `ExAllocatePool2` zeroes every block unless `POOL_FLAG_UNINITIALIZED` is set,
   and `POOL_ZEROES` says which applies. `alloc_zeroed` and `allocate_zeroed`
   return zeroed memory either way. Microsoft advises against skipping the
@@ -159,6 +163,15 @@ unsafe { Alloc::deallocate_aligned(ptr, layout) };
 
 `kernel_allocate` is `allocate` without the test backend: it always reaches the
 pool, with or without `usermode-backend`.
+
+Realignment is on by default. A driver that never needs more than the pool's
+own alignment can turn it off by setting `REALIGN` to `false`, as in
+`NonPagedAlloc<DEFAULT_MEMORY_TAG, true, false>`: every request then goes to the
+pool by size, and the alignment a `Layout` asks for is ignored. Only do so if
+nothing allocated through it needs more, including types from other crates: a
+misaligned `Box` or reference is undefined behaviour, which rules out
+`#[repr(align(32))]` and larger types, 256- and 512-bit SIMD types, and
+crossbeam's `CachePadded`.
 
 ## The `Allocator` API (Rust 1.100)
 
@@ -212,7 +225,7 @@ There are no default features.
 
 | Item                                      | What it is                                                     |
 | ----------------------------------------- | -------------------------------------------------------------- |
-| `NtAlloc`                                 | the allocator: pool flags, tag, and tagged or untagged free    |
+| `NtAlloc`                                 | the allocator: pool flags, tag, free routine, realignment      |
 | `PagedAlloc`, `NonPagedAlloc`             | `NtAlloc` on the paged and non-paged pool                      |
 | `POOL_FLAGS`, `POOL_FLAG_*`               | the pool flags `ExAllocatePool2` takes                         |
 | `DEFAULT_MEMORY_TAG`                      | the default tag, `Rust`                                        |

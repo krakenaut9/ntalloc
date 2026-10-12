@@ -15,13 +15,14 @@ First public release.
 
 ### Added
 
-- `NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>`, a zero-sized
-  allocator over `ExAllocatePool2` configured entirely at compile time: the
-  pool flags, the pool tag, and whether freeing goes through
-  `ExFreePoolWithTag` or `ExFreePool`.
+- `NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>`, a
+  zero-sized allocator over `ExAllocatePool2` configured entirely at compile
+  time: the pool flags, the pool tag, whether freeing goes through
+  `ExFreePoolWithTag` or `ExFreePool`, and whether to realign requests the pool
+  cannot align by itself, which it does by default.
 - `PagedAlloc` and `NonPagedAlloc`, aliases for the two pools that default the
-  tag to `DEFAULT_MEMORY_TAG` (shown as `Rust` by `!poolused`) and free with
-  the tag checked.
+  tag to `DEFAULT_MEMORY_TAG` (shown as `Rust` by `!poolused`), free with the
+  tag checked, and realign when needed.
 - A `GlobalAlloc` implementation, so either alias can be a driver's
   `#[global_allocator]`. `alloc_zeroed` skips the second zeroing pass when the
   pool has already zeroed the block, which `POOL_ZEROES` reports.
@@ -29,6 +30,8 @@ First public release.
   `kernel_alignment` gives what the pool guarantees for a size; anything more
   is served by over-allocating and storing the pool's pointer just before the
   aligned one. `MIN_ALIGNMENT` and `POINTER_SIZE` describe that layout.
+  Realignment can be turned off with `REALIGN`, for drivers that never need
+  more than the pool's own alignment.
 - `allocate`, `allocate_aligned`, `deallocate`, `deallocate_aligned` and
   `kernel_allocate`, the same operations as associated functions.
 - `POOL_FLAGS` and the flags an allocator for Rust data has a use for:

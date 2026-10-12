@@ -78,8 +78,12 @@ fn usermode_misuse(message: core::fmt::Arguments<'_>) -> ! {
     std::process::abort()
 }
 
-impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
     /// Stand-in for [`NtAlloc::kernel_allocate`] in this crate's own tests and
     /// under the `usermode-backend` feature: allocates `size` bytes from the

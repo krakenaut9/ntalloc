@@ -19,6 +19,9 @@ type Paged = PagedAlloc<DEFAULT_MEMORY_TAG, true>;
 /// The same pool, freed with `ExFreePoolWithTag`, under another tag.
 type OtherTag = PagedAlloc<{ u32::from_ne_bytes(*b"Othr") }, true>;
 
+/// The same pool with `REALIGN` off, named through the alias as a driver would.
+type NoRealign = PagedAlloc<DEFAULT_MEMORY_TAG, true, false>;
+
 #[test]
 fn allocate_and_deallocate_pair_up() {
     // Before the heap backend could free from a pointer alone, the free half
@@ -48,6 +51,36 @@ fn allocate_aligned_honours_every_alignment() {
             unsafe { ptr.write_bytes(0x5A, size) };
             // SAFETY: from `allocate_aligned` with this exact layout.
             unsafe { Paged::deallocate_aligned(ptr, layout) };
+        }
+    }
+}
+
+#[test]
+fn realign_off_serves_every_layout_at_the_pools_own_alignment() {
+    let alloc = NoRealign::default();
+    for align in [1usize, 8, 16, 32, 64, 4096, 8192, 65_536] {
+        for size in [1usize, 17, 4096, 10_000] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            // Only the pool's own alignment is promised: whatever more `align`
+            // asks for is ignored.
+            let pool_alignment = NoRealign::kernel_alignment(size);
+
+            // SAFETY: `layout` has a non-zero size.
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null(), "size {size}, align {align}");
+            assert_eq!(ptr.addr() % pool_alignment, 0, "size {size}, align {align}");
+            // SAFETY: `ptr` holds `size` writable bytes.
+            unsafe { ptr.write_bytes(0x3C, size) };
+            // SAFETY: from `alloc` with this exact layout, freed once.
+            unsafe { alloc.dealloc(ptr, layout) };
+
+            #[cfg(feature = "allocator-api")]
+            {
+                let block = alloc.allocate(layout).unwrap();
+                assert_eq!(block.len(), size, "size {size}, align {align}");
+                // SAFETY: from `allocate` with this exact layout.
+                unsafe { alloc.deallocate(block.cast(), layout) };
+            }
         }
     }
 }

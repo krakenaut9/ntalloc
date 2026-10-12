@@ -13,9 +13,10 @@
 //! # Overview
 //!
 //! - [`NtAlloc`] is a zero-sized allocator type parameterized over the pool
-//!   flags, the memory tag, and whether deallocation uses the tagged or
-//!   untagged free routine. The pool flags are exported as `POOL_FLAG_*`
-//!   constants, such as [`POOL_FLAG_NON_PAGED`] and
+//!   flags, the memory tag, whether deallocation uses the tagged or untagged
+//!   free routine, and whether it realigns requests the pool cannot align by
+//!   itself, which it does by default. The pool flags are exported as
+//!   `POOL_FLAG_*` constants, such as [`POOL_FLAG_NON_PAGED`] and
 //!   [`POOL_FLAG_UNINITIALIZED`].
 //! - [`PagedAlloc`] and [`NonPagedAlloc`] are convenience aliases for the
 //!   paged and non-paged pool, respectively.
@@ -41,6 +42,10 @@
 //! slot back out to recover the pointer that must be passed to
 //! `ExFreePool`/`ExFreePoolWithTag`, which is why an over-aligned allocation
 //! has to be released through it rather than through [`NtAlloc::deallocate`].
+//!
+//! Realignment is the default. A driver that never needs more than the pool's
+//! own alignment can turn it off with the `REALIGN` parameter, as described
+//! under [Turning realignment off](NtAlloc#turning-realignment-off).
 //!
 //! # Example
 //!
@@ -219,6 +224,13 @@ const fn tag_has_letter_or_digit(tag: u32) -> bool {
 ///   `true` uses `ExFreePoolWithTag` (the tag must match the one the memory
 ///   was allocated with), `false` uses the untagged `ExFreePool`. Defaults to
 ///   `true`.
+/// - `REALIGN`: whether [`NtAlloc::allocate_aligned`], and through it the
+///   [`GlobalAlloc`] and [`Allocator`] implementations, serve a [`Layout`]
+///   aligned more strictly than the pool guarantees for its size (see
+///   [`NtAlloc::kernel_alignment`]) by over-allocating and realigning, as the
+///   [crate documentation](crate#design) describes. Defaults to `true`;
+///   `false` turns realignment off, as described
+///   [below](#turning-realignment-off).
 ///
 /// Prefer the [`PagedAlloc`]/[`NonPagedAlloc`] aliases over naming `NtAlloc`
 /// directly, unless the configuration needs more flags than the pool:
@@ -236,6 +248,44 @@ const fn tag_has_letter_or_digit(tag: u32) -> bool {
 /// as `type Alloc = NonPagedAlloc;` followed by `Alloc::allocate(64)`. Writing
 /// `NonPagedAlloc::allocate(64)` does not compile (E0284): Rust fills in the
 /// aliases' default parameters only where a type is expected.
+///
+/// # Turning realignment off
+///
+/// Realignment is on by default. A driver that never needs more than the
+/// pool's own alignment can turn it off by setting `REALIGN` to `false`:
+/// [`NtAlloc::allocate_aligned`], and with it the [`GlobalAlloc`] and
+/// [`Allocator`] implementations, then pass every request to the pool by size
+/// and ignore the alignment it asks for. Nothing is over-allocated or stored
+/// next to a block, and a block is aligned only as the pool aligns it: to
+/// [`MIN_ALIGNMENT`] below a page, and to a page from one page up.
+///
+/// Only do so if nothing allocated through such a configuration needs more,
+/// including types from other crates, which a `#[global_allocator]` serves
+/// too. Anything `#[repr(align(32))]` or larger needs more, as do 256- and
+/// 512-bit SIMD vectors and cache-padded wrappers such as crossbeam's
+/// `CachePadded`. A misaligned `Box` or reference is undefined behaviour, and
+/// an aligned SIMD load from one faults, which in a driver is a bug check.
+/// Debug builds usually stop at the first misaligned access, with "misaligned
+/// pointer dereference"; release builds do not.
+///
+/// ```no_run
+/// use core::alloc::{GlobalAlloc, Layout};
+/// use ntalloc::{DEFAULT_MEMORY_TAG, MIN_ALIGNMENT, NonPagedAlloc};
+///
+/// type NoRealignAlloc = NonPagedAlloc<DEFAULT_MEMORY_TAG, true, false>;
+///
+/// let alloc = NoRealignAlloc::default();
+///
+/// // Asks for 64-byte alignment, but gets only what the pool gives a small block.
+/// let layout = Layout::from_size_align(64, 64).unwrap();
+/// // SAFETY: the layout has a non-zero size.
+/// let ptr = unsafe { alloc.alloc(layout) };
+/// assert!(!ptr.is_null());
+/// assert_eq!(ptr as usize % MIN_ALIGNMENT, 0);
+///
+/// // SAFETY: from `alloc` with this layout, freed once.
+/// unsafe { alloc.dealloc(ptr, layout) };
+/// ```
 ///
 /// # Unsupported configurations
 ///
@@ -314,6 +364,7 @@ pub struct NtAlloc<
     const ALLOC_POOL_FLAGS: POOL_FLAGS,
     const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG,
     const TAGGED_DEALLOC: bool = true,
+    const REALIGN: bool = true,
 >;
 
 /// [`NtAlloc`] backed by the paged pool ([`POOL_FLAG_PAGED`]).
@@ -322,8 +373,11 @@ pub struct NtAlloc<
 /// touched at IRQL `APC_LEVEL` or below — that is, strictly below
 /// `DISPATCH_LEVEL`. Never touch it from a DPC, from an ISR, or while
 /// holding a spin lock.
-pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEALLOC: bool = true> =
-    NtAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
+pub type PagedAlloc<
+    const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG,
+    const TAGGED_DEALLOC: bool = true,
+    const REALIGN: bool = true,
+> = NtAlloc<POOL_FLAG_PAGED, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>;
 /// [`NtAlloc`] backed by the non-paged pool ([`POOL_FLAG_NON_PAGED`]).
 ///
 /// Non-paged pool memory is always resident and safe to access at any IRQL,
@@ -332,7 +386,8 @@ pub type PagedAlloc<const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG, const TAGGED_DEA
 pub type NonPagedAlloc<
     const MEMORY_TAG: u32 = DEFAULT_MEMORY_TAG,
     const TAGGED_DEALLOC: bool = true,
-> = NtAlloc<POOL_FLAG_NON_PAGED, MEMORY_TAG, TAGGED_DEALLOC>;
+    const REALIGN: bool = true,
+> = NtAlloc<POOL_FLAG_NON_PAGED, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>;
 
 /// Size, in bytes, of a pointer on the target platform.
 pub const POINTER_SIZE: usize = size_of::<*const u8>();
@@ -341,8 +396,12 @@ pub const POINTER_SIZE: usize = size_of::<*const u8>();
 /// pointers: 16 bytes on 64-bit targets, 8 bytes on 32-bit).
 pub const MIN_ALIGNMENT: usize = POINTER_SIZE * 2;
 
-impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
     /// Whether allocations from this configuration arrive zero-initialized.
     ///
@@ -664,22 +723,25 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
         allocated_buffer.map_addr(|addr| (addr & alignment_mask_base) + alignment)
     }
 
-    /// Allocates memory satisfying `layout`, handling alignment requirements
-    /// stronger than what the kernel pool allocator natively provides.
+    /// Allocates memory for `layout`, handling alignment requirements stronger
+    /// than what the kernel pool allocator natively provides.
     ///
     /// If `layout.align()` is no stronger than [`NtAlloc::kernel_alignment`]
     /// for the requested size, this simply forwards to [`NtAlloc::allocate`].
-    /// Otherwise it over-allocates by `layout.align()` extra bytes, rounds
-    /// the result up to `layout.align()`, and
-    /// stashes the original pointer just before the returned one (see the
-    /// crate-level documentation for details).
+    /// Otherwise it over-allocates by `layout.align()` extra bytes, rounds the
+    /// result up to `layout.align()`, and stashes the original pointer just
+    /// before the returned one (see the crate-level documentation for
+    /// details). With `REALIGN` set to `false` it forwards every request to
+    /// [`NtAlloc::allocate`] instead: see
+    /// [Turning realignment off](NtAlloc#turning-realignment-off).
     ///
     /// # Parameters
     /// - `layout`: the size and alignment to allocate for.
     ///
     /// # Returns
-    /// A pointer to memory satisfying `layout`, or a null pointer on
-    /// allocation failure.
+    /// A pointer to `layout.size()` bytes aligned to `layout.align()` (only to
+    /// the pool's own alignment when `REALIGN` is `false`), or a null pointer
+    /// on allocation failure.
     ///
     /// A zero-size `layout` always returns a null pointer, and never reaches
     /// the pool. [`GlobalAlloc`] calls a zero-size request undefined
@@ -723,7 +785,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return null_mut();
         }
 
-        if Self::is_kernel_aligned(layout) {
+        if !REALIGN || Self::is_kernel_aligned(layout) {
+            // Without REALIGN the alignment asked for is ignored, as NtAlloc's
+            // documentation warns: the block is aligned as the pool aligns it.
             Self::allocate(layout.size())
         } else {
             // Cannot overflow: Layout guarantees size rounded up to align is
@@ -759,12 +823,12 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     /// `NonNull<[u8]>` slice.
     ///
     /// # Returns
-    /// - `Ok(_)` — a `NonNull<[u8]>` slice of `layout.size()` bytes.
-    /// - `Err(AllocError)` — if the underlying pool allocation fails, and
-    ///   also when `layout.size()` is `0` and `layout.align()` is no greater
-    ///   than [`MIN_ALIGNMENT`], since [`NtAlloc::allocate`] short-circuits a
-    ///   zero-size request to a null pointer. The [`Allocator::allocate`]
-    ///   implementation documents that case in full.
+    /// - `Ok(_)` — a `NonNull<[u8]>` slice of `layout.size()` bytes, aligned as
+    ///   [`NtAlloc::allocate_aligned`] describes, or, for a zero-size
+    ///   `layout`, a dangling pointer aligned to `layout.align()` that never
+    ///   reached the pool. The [`Allocator::allocate`] implementation
+    ///   documents that case in full.
+    /// - `Err(AllocError)` — if the underlying pool allocation fails.
     #[cfg(feature = "allocator-api")]
     #[clippy::msrv = "1.100"]
     fn allocate_slice(layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -902,7 +966,8 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
     ///
     /// - `ptr` was returned by [`NtAlloc::allocate_aligned`] on this same
     ///   `NtAlloc` instantiation — the same pool flags, the same
-    ///   `MEMORY_TAG`, and the same `TAGGED_DEALLOC` — or is null.
+    ///   `MEMORY_TAG`, the same `TAGGED_DEALLOC` and the same `REALIGN` — or
+    ///   is null.
     /// - `layout` is the *exact* `Layout` that was passed to that call.
     ///   `layout` alone decides whether the original pointer is read back
     ///   from the slot before `ptr` or `ptr` is freed directly, so a
@@ -926,7 +991,9 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
             return;
         }
 
-        let original_ptr = if Self::is_kernel_aligned(layout) {
+        // Without REALIGN nothing is ever stashed: allocate_aligned hands out the
+        // pool's own pointer for every layout.
+        let original_ptr = if !REALIGN || Self::is_kernel_aligned(layout) {
             ptr
         } else {
             Self::original_pointer(ptr)
@@ -949,7 +1016,10 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 //
 // - `alloc` returns null or `layout.size()` bytes aligned to `layout.align()`:
 //   the pool's own block when its alignment suffices, otherwise an address
-//   realigned inside a block over-allocated by `layout.align()`;
+//   realigned inside a block over-allocated by `layout.align()`. With `REALIGN`
+//   set to `false` it returns the pool's own block whatever the layout asks
+//   for, so that promise holds only for layouts within the pool's alignment;
+//   NtAlloc documents that such a configuration must not be asked for more;
 // - a block belongs to the pool, not to the allocator value, so it stays valid
 //   until `dealloc` hands it back, recovering the pool's own address from the
 //   same layout;
@@ -958,16 +1028,20 @@ impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEA
 // - in a release build nothing on the pool path panics; its `debug_assert!`s
 //   fire only on a bug here or on a caller that broke the contract, and the
 //   heap backend aborts rather than unwinds on misuse.
-unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    GlobalAlloc for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+unsafe impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> GlobalAlloc for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
-    /// Allocates memory satisfying `layout` via [`NtAlloc::allocate_aligned`].
+    /// Allocates memory for `layout` via [`NtAlloc::allocate_aligned`].
     ///
     /// # Safety
-    /// This method upholds the [`GlobalAlloc::alloc`] contract: `layout`
-    /// must have non-zero size, and the caller must pass the exact same
-    /// `layout` to [`GlobalAlloc::dealloc`] (or `realloc`) when freeing the
-    /// returned pointer.
+    /// As [`GlobalAlloc::alloc`] requires: `layout` must have non-zero size,
+    /// and the caller must pass the exact same `layout` to
+    /// [`GlobalAlloc::dealloc`] (or `realloc`) when freeing the returned
+    /// pointer.
     ///
     /// Should a zero-size `layout` arrive anyway, this returns null rather
     /// than reaching `ExAllocatePool2`, which documents no behaviour for a
@@ -991,7 +1065,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
         unsafe { Self::deallocate_aligned(ptr, layout) };
     }
 
-    /// Allocates zero-initialized memory satisfying `layout`.
+    /// Allocates zero-initialized memory for `layout`.
     ///
     /// The default implementation of this method allocates and then writes
     /// zeroes over the whole block. `ExAllocatePool2` has already done that,
@@ -999,8 +1073,8 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
     /// allocation and the second pass is skipped — the condition is a const,
     /// so only one branch survives compilation.
     ///
-    /// For an over-aligned request the returned region still arrives zeroed:
-    /// it lies inside the larger block the pool zeroed, and the pointer
+    /// For a realigned request the returned region still arrives zeroed: it
+    /// lies inside the larger block the pool zeroed, and the pointer
     /// [`NtAlloc::allocate_aligned`] stashes goes in the bytes *before* it.
     ///
     /// # Safety
@@ -1035,16 +1109,23 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 //   what another allocated;
 // - `allocate` reports exactly `layout.size()` bytes, so the layout the free
 //   path receives is the one the stash decision was made with;
+// - with `REALIGN` set to `false`, `allocate` returns the pool's own block
+//   whatever `layout.align()` asks for, so the block fits the layout only when
+//   the pool's alignment covers it, which NtAlloc documents as the condition
+//   for using such a configuration;
 // - a zero-size request gets a dangling, aligned pointer, which `deallocate`
 //   recognizes and never frees.
 #[cfg(feature = "allocator-api")]
 #[clippy::msrv = "1.100"]
-unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+unsafe impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> Allocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
-    /// Allocates memory satisfying `layout` via [`NtAlloc::allocate_aligned`],
-    /// returning it as a `NonNull<[u8]>` slice per the [`Allocator::allocate`]
-    /// contract.
+    /// Allocates memory for `layout` via [`NtAlloc::allocate_aligned`],
+    /// returning it as a `NonNull<[u8]>` slice.
     ///
     /// # Returns
     /// - `Ok(_)` — a `NonNull<[u8]>` slice of exactly `layout.size()` bytes
@@ -1060,7 +1141,7 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
         Self::allocate_slice(layout)
     }
 
-    /// Allocates zero-initialized memory satisfying `layout`.
+    /// Allocates zero-initialized memory for `layout`.
     ///
     /// Skips the second zeroing pass the default implementation would make
     /// whenever [`NtAlloc::POOL_ZEROES`] holds, for the reasons given on
@@ -1116,8 +1197,12 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // A pool block therefore stays valid until the matching `ExFreePool` or
 // `ExFreePoolWithTag`, regardless of what happens to the allocator value.
 #[cfg(feature = "allocator-api-markers")]
-unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    StaticAllocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+unsafe impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> StaticAllocator for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
 }
 
@@ -1130,8 +1215,12 @@ unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAG
 // value and cannot unwind. The type is also `Copy`, which preserves that
 // equivalence exactly as cloning does.
 #[cfg(feature = "allocator-api-markers")]
-unsafe impl<const ALLOC_POOL_FLAGS: POOL_FLAGS, const MEMORY_TAG: u32, const TAGGED_DEALLOC: bool>
-    AllocatorClone for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC>
+unsafe impl<
+    const ALLOC_POOL_FLAGS: POOL_FLAGS,
+    const MEMORY_TAG: u32,
+    const TAGGED_DEALLOC: bool,
+    const REALIGN: bool,
+> AllocatorClone for NtAlloc<ALLOC_POOL_FLAGS, MEMORY_TAG, TAGGED_DEALLOC, REALIGN>
 {
 }
 
